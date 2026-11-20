@@ -1,4 +1,4 @@
-# Builds bin\Legram.exe with the native .NET Framework 4.x C# compiler (csc.exe).
+﻿# Builds bin\Legram.exe with the native .NET Framework 4.x C# compiler (csc.exe).
 # Zero NuGet, zero Electron, zero external SDKs — ~208 KB native x64 binary.
 param([string]$Out = (Join-Path $PSScriptRoot '..\bin'))
 $ErrorActionPreference = 'Stop'
@@ -37,8 +37,7 @@ $refs = @(
     'System.Core.dll',
     'System.Drawing.dll',
     'System.Windows.Forms.dll',
-    'System.Xaml.dll',
-    'System.Management.dll'
+    'System.Xaml.dll'
 ) | ForEach-Object { "/reference:$fx\$_" }
 $refs += @(
     'WindowsBase.dll',

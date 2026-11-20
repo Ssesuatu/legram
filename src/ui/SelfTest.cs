@@ -21,7 +21,7 @@ namespace Legram
             Directory.CreateDirectory(outDir);
             int failures = 0;
 
-            Console.WriteLine("=== LEGRAM v2.5.0 — LIVE PC SELFTEST ===");
+            Console.WriteLine("=== LEGRAM v2.6.0 — LIVE PC SELFTEST ===");
             Stopwatch swTotal = Stopwatch.StartNew();
 
             AppSettings settings = AppSettings.Load();
@@ -318,6 +318,277 @@ namespace Legram
                     dwmProtectedFromKillAndEco,
                     Fmt.BytesShort(selfDeflatedBytes),
                     selfIoAfterDeflate));
+
+                // =========================================================================
+                // FEATURE #6: Game Mode Auto-Pause (Anti Micro-Stutter) & 1-Click Whitelist Shield
+                // =========================================================================
+                SystemSnapshot simGameActive = new SystemSnapshot
+                {
+                    TotalRamBytes = 16L * 1024 * 1024 * 1024,
+                    AvailableRamBytes = 1800L * 1024 * 1024,
+                    UsedRamPercent = 89,
+                    CommitTotalBytes = 36400L * 1024 * 1024,
+                    CommitLimitBytes = 40000L * 1024 * 1024,
+                    StandbyTotalBytes = 5200L * 1024 * 1024,
+                    FreeZeroBytes = 420L * 1024 * 1024,
+                    GameShieldActive = true,
+                    ActiveGameName = "FullscreenGame"
+                };
+                string gamePausedReason = RamEngine.EvaluateAutoGuardTrigger(simGameActive);
+                bool d3dExcl;
+                bool fgFullscreenNow = NativeApi.IsForegroundWindowFullscreen(NativeApi.GetForegroundWindow(), out d3dExcl);
+
+                // Pick a live non-protected process group from TopGroups (or fallback "chrome") to test 1-Click Immune Shield
+                bool foundLiveCandidate = false;
+                string testGroupKey = "chrome";
+                for (int i = 0; i < snap.TopGroups.Count; i++)
+                {
+                    ProcessGroupItem pg = snap.TopGroups[i];
+                    if (pg != null && !pg.IsProtected && !pg.IsOrphanGroup && !string.IsNullOrEmpty(pg.GroupKey))
+                    {
+                        testGroupKey = pg.GroupKey;
+                        foundLiveCandidate = true;
+                        break;
+                    }
+                }
+                bool hadImmuneBefore = settings.IsGroupImmune(testGroupKey);
+                settings.SetGroupImmune(testGroupKey, true);
+                HashSet<string> testImmuneSet = settings.SnapshotImmuneGroups();
+                GuardScanResult immuneScan = ProcessGuard.Scan(null, null, false, testImmuneSet, true);
+                HashSet<int> throttledAfterImmune = eco.ReconcileAndSnapshot(immuneScan);
+
+                bool groupMarkedImmune = !foundLiveCandidate && immuneScan.UserImmuneGroupCount >= 1;
+                bool allGroupPidsProtectedAndUnthrottled = true;
+                for (int i = 0; i < immuneScan.TopGroups.Count; i++)
+                {
+                    ProcessGroupItem pg = immuneScan.TopGroups[i];
+                    if (pg != null && string.Equals(pg.GroupKey, testGroupKey, StringComparison.OrdinalIgnoreCase))
+                    {
+                        groupMarkedImmune = pg.IsUserWhitelisted;
+                        for (int k = 0; k < pg.Pids.Count; k++)
+                        {
+                            int gPid = pg.Pids[k];
+                            if (!immuneScan.ProtectedPids.Contains(gPid) || throttledAfterImmune.Contains(gPid))
+                            {
+                                allGroupPidsProtectedAndUnthrottled = false;
+                            }
+                        }
+                        break;
+                    }
+                }
+                settings.SetGroupImmune(testGroupKey, hadImmuneBefore);
+
+                bool f6Pass = (gamePausedReason == null)
+                    && testImmuneSet.Contains(testGroupKey)
+                    && groupMarkedImmune
+                    && allGroupPidsProtectedAndUnthrottled;
+                if (!f6Pass) failures++;
+
+                Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
+                    "[F6] Game Mode Auto-Pause & 1-Click Immune Shield -> PASS={0} | SimGame89%RAM Trigger={1} (Paused!) | LiveFullscreen={2} (D3D={3}) | ImmuneTest({4}): MarkedImmune={5}, AllPidsProtectedAndUnthrottled={6}",
+                    f6Pass,
+                    gamePausedReason ?? "null",
+                    fgFullscreenNow,
+                    d3dExcl,
+                    testGroupKey,
+                    groupMarkedImmune,
+                    allGroupPidsProtectedAndUnthrottled));
+
+                // =========================================================================
+                // FEATURE #7: Virtual Desktop Auto-Sleep & Active Desktop Indicator (Desk 1/2)
+                // =========================================================================
+                VirtualDesktopState liveVd = VirtualDesktopShield.SampleAndFollow(IntPtr.Zero, false);
+                bool vdLiveValid = liveVd != null
+                    && liveVd.ActiveDesktopNumber >= 1
+                    && liveVd.TotalDesktopCount >= 1
+                    && liveVd.ActiveDesktopNumber <= liveVd.TotalDesktopCount;
+
+                // Simulate a secondary desktop where an unprotected process group lives on Desktop 1 while user is on Desktop 2
+                int simSleepPid = 0;
+                for (int i = 0; i < snap.TopGroups.Count; i++)
+                {
+                    ProcessGroupItem pg = snap.TopGroups[i];
+                    if (pg != null && !pg.IsProtected && pg.Pids != null && pg.Pids.Count > 0)
+                    {
+                        simSleepPid = pg.Pids[0];
+                        break;
+                    }
+                }
+                bool simDesktopSleepOk = true;
+                if (simSleepPid > 0)
+                {
+                    VirtualDesktopState simVdAway = new VirtualDesktopState
+                    {
+                        ActiveDesktopNumber = 2,
+                        TotalDesktopCount = Math.Max(2, liveVd != null ? liveVd.TotalDesktopCount : 2),
+                        ActiveDesktopName = "Desktop 2"
+                    };
+                    simVdAway.PidsOnInactiveDesktops.Add(simSleepPid);
+                    simVdAway.PidPrimaryDesktopNumber[simSleepPid] = 1;
+
+                    GuardScanResult vdAwayScan = ProcessGuard.Scan(null, null, false, null, true, simVdAway);
+                    HashSet<int> vdAwayThrottled = eco.ReconcileAndSnapshot(vdAwayScan);
+                    bool markedInactiveSleep = vdAwayScan.InactiveDesktopSleepPids.Contains(simSleepPid)
+                        && !vdAwayScan.ProtectedPids.Contains(simSleepPid);
+
+                    // Now simulate switching back to Desktop 1 -> Instant Wake when active on Desktop 1
+                    VirtualDesktopState simVdReturn = new VirtualDesktopState
+                    {
+                        ActiveDesktopNumber = 1,
+                        TotalDesktopCount = Math.Max(2, liveVd != null ? liveVd.TotalDesktopCount : 2),
+                        ActiveDesktopName = "Desktop 1"
+                    };
+                    simVdReturn.PidsOnActiveDesktop.Add(simSleepPid);
+                    simVdReturn.PidPrimaryDesktopNumber[simSleepPid] = 1;
+
+                    GuardScanResult vdReturnScan = ProcessGuard.Scan(null, null, false, null, true, simVdReturn);
+                    bool clearedInactiveOnReturn = !vdReturnScan.InactiveDesktopSleepPids.Contains(simSleepPid);
+                    simDesktopSleepOk = markedInactiveSleep && vdAwayThrottled.Contains(simSleepPid) && clearedInactiveOnReturn;
+                }
+
+                bool f7Pass = vdLiveValid && simDesktopSleepOk;
+                if (!f7Pass) failures++;
+
+                Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
+                    "[F7] Virtual Desktop Auto-Sleep & Indicator -> PASS={0} | LiveDesk=Desk {1}/{2} (\"{3}\"), ActivePids={4}, InactivePids={5} | SimAwayWakeOk={6}",
+                    f7Pass,
+                    liveVd != null ? liveVd.ActiveDesktopNumber : 1,
+                    liveVd != null ? liveVd.TotalDesktopCount : 1,
+                    liveVd != null ? liveVd.ActiveDesktopName : "Desktop 1",
+                    liveVd != null ? liveVd.PidsOnActiveDesktop.Count : 0,
+                    liveVd != null ? liveVd.PidsOnInactiveDesktops.Count : 0,
+                    simDesktopSleepOk));
+
+                // =========================================================================
+                // FEATURE #8: Paket A+B+C Verification (MemoryPriority Restore, Multi-AI LM Studio + ComfyUI, Port Probe)
+                // =========================================================================
+                EcoQosManager.ApplyProcessQos(selfPid, false);
+                uint memPrioBefore = EcoQosManager.QueryProcessMemoryPriority(selfPid);
+                bool trimSafeOk = RamEngine.TrimSingleProcessSafe(selfPid, true, false);
+                uint memPrioAfter = EcoQosManager.QueryProcessMemoryPriority(selfPid);
+                bool f8MemPrioPass = trimSafeOk && memPrioBefore >= 3 && memPrioAfter == memPrioBefore;
+
+                string capturedLmsUnload = "";
+                string capturedComfyFree = "";
+                int mockLmsUnloaded = 0;
+                bool mockComfyFreed = false;
+                bool portListenDetected = false;
+
+                TcpListener aiMock = new TcpListener(IPAddress.Loopback, 0);
+                aiMock.Start();
+                int aiPort = ((IPEndPoint)aiMock.LocalEndpoint).Port;
+                portListenDetected = NativeApi.IsLoopbackTcpPortListening(aiPort);
+                string aiBaseUrl = "http://127.0.0.1:" + aiPort.ToString(CultureInfo.InvariantCulture);
+
+                Thread aiServerThread = new Thread(delegate()
+                {
+                    for (int reqIdx = 0; reqIdx < 4; reqIdx++)
+                    {
+                        try
+                        {
+                            using (TcpClient client = aiMock.AcceptTcpClient())
+                            using (NetworkStream ns = client.GetStream())
+                            {
+                                client.ReceiveTimeout = 1500;
+                                client.SendTimeout = 1500;
+                                MemoryStream reqMs = new MemoryStream();
+                                byte[] buf = new byte[1024];
+                                string rawReq = "";
+                                int bodySep = -1;
+                                int expectedBodyLen = 0;
+
+                                while (true)
+                                {
+                                    int n = ns.Read(buf, 0, buf.Length);
+                                    if (n <= 0) break;
+                                    reqMs.Write(buf, 0, n);
+                                    rawReq = Encoding.UTF8.GetString(reqMs.ToArray());
+                                    bodySep = rawReq.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+                                    if (bodySep >= 0)
+                                    {
+                                        string hdrPart = rawReq.Substring(0, bodySep);
+                                        int clIdx = hdrPart.IndexOf("Content-Length:", StringComparison.OrdinalIgnoreCase);
+                                        if (clIdx >= 0)
+                                        {
+                                            int clEnd = hdrPart.IndexOf("\r\n", clIdx, StringComparison.Ordinal);
+                                            string clVal = (clEnd >= 0 ? hdrPart.Substring(clIdx + 15, clEnd - (clIdx + 15)) : hdrPart.Substring(clIdx + 15)).Trim();
+                                            int.TryParse(clVal, NumberStyles.Integer, CultureInfo.InvariantCulture, out expectedBodyLen);
+                                        }
+                                        int bodyBytesHave = Encoding.UTF8.GetByteCount(rawReq.Substring(bodySep + 4));
+                                        if (bodyBytesHave >= expectedBodyLen) break;
+                                    }
+                                }
+                                if (rawReq.Length == 0) break;
+                                string reqBody = bodySep >= 0 ? rawReq.Substring(bodySep + 4) : "";
+
+                                string jsonResp = "{}";
+                                if (rawReq.StartsWith("GET /api/v1/models", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    jsonResp = "{\"data\":[{\"id\":\"qwen2.5-coder-14b\",\"state\":\"loaded\"}]}";
+                                }
+                                else if (rawReq.StartsWith("POST /api/v1/models/unload", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    capturedLmsUnload = reqBody;
+                                    jsonResp = "{\"status\":\"unloaded\"}";
+                                }
+                                else if (rawReq.StartsWith("GET /queue", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    jsonResp = "{\"queue_running\":[],\"queue_pending\":[]}";
+                                }
+                                else if (rawReq.StartsWith("POST /free", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    capturedComfyFree = reqBody;
+                                    jsonResp = "{\"status\":\"ok\"}";
+                                }
+
+                                byte[] bodyBytes = Encoding.UTF8.GetBytes(jsonResp);
+                                string hdr = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+                                    + bodyBytes.Length.ToString(CultureInfo.InvariantCulture)
+                                    + "\r\nConnection: close\r\n\r\n";
+                                byte[] hdrBytes = Encoding.ASCII.GetBytes(hdr);
+                                ns.Write(hdrBytes, 0, hdrBytes.Length);
+                                ns.Write(bodyBytes, 0, bodyBytes.Length);
+                                ns.Flush();
+                            }
+                        }
+                        catch
+                        {
+                            break;
+                        }
+                    }
+                });
+                aiServerThread.IsBackground = true;
+                aiServerThread.Start();
+
+                try
+                {
+                    mockLmsUnloaded = GpuVramMonitor.EvictLmStudioModelsAtEndpoint(aiBaseUrl);
+                    mockComfyFreed = GpuVramMonitor.FreeComfyUiMemoryAtEndpoint(aiBaseUrl);
+                }
+                finally
+                {
+                    try { aiMock.Stop(); } catch { }
+                }
+
+                bool f8MultiAiPass = portListenDetected
+                    && mockLmsUnloaded == 1
+                    && capturedLmsUnload.IndexOf("qwen2.5-coder-14b", StringComparison.Ordinal) >= 0
+                    && mockComfyFreed
+                    && capturedComfyFree.IndexOf("\"unload_models\":true", StringComparison.Ordinal) >= 0;
+
+                if (!f8MemPrioPass || !f8MultiAiPass) failures++;
+
+                Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
+                    "[F8] MemoryPriority Restore & Multi-AI (LM Studio + ComfyUI) -> PASS={0} | MemPrio {1}->{2} | TcpProbe(:{3})={4} | LMS Unload={5} ({6}) | ComfyUI Free={7} ({8})",
+                    f8MemPrioPass && f8MultiAiPass,
+                    memPrioBefore,
+                    memPrioAfter,
+                    aiPort,
+                    portListenDetected,
+                    mockLmsUnloaded,
+                    capturedLmsUnload,
+                    mockComfyFreed,
+                    capturedComfyFree));
 
                 // =========================================================================
                 // UI Audit + 2x HiDPI Render Proofs + Live 1-Button Unified Harmony

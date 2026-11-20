@@ -22,10 +22,21 @@ namespace Legram
         private readonly SemaphoreSlim purgeGate = new SemaphoreSlim(1, 1);
         private DateTime bootUtc = DateTime.UtcNow;
         private DateTime lastAutoPurgeUtc = DateTime.MinValue;
+        private DateTime lastAutoCombineUtc = DateTime.MinValue;
+        private DateTime lastResumeUtc = DateTime.MinValue;
         private DateTime taskCheckUtc = DateTime.MinValue;
         private bool cachedTaskReady;
         private int busyFlag;
         private volatile bool disposed;
+
+        private string lastHarmonizeSummary = "Ready (No sweep yet this session)";
+        private long sessionTotalFreedBytes;
+        private int sessionHarmonizeCount;
+
+        private IntPtr legramWindowHwnd = IntPtr.Zero;
+        private int lastObservedDesktopNumber = 1;
+        private int desktopSwitchGeneration;
+        private readonly Dictionary<int, DateTime> lastTrimUtcByDesktop = new Dictionary<int, DateTime>();
 
         public event EventHandler SnapshotUpdated;
         public event EventHandler<PurgeCompletedEventArgs> AutoPurgeCompleted;
@@ -44,6 +55,194 @@ namespace Legram
         {
             settings = appSettings;
             ecoQos = ecoManager;
+            if (ecoQos != null)
+            {
+                ecoQos.VirtualDesktopSleep = settings == null || settings.VirtualDesktopSleepEnabled;
+                ecoQos.ForegroundSwitched += OnForegroundSwitchedFromHook;
+            }
+        }
+
+        public void AttachWindowHwnd(IntPtr hwnd)
+        {
+            legramWindowHwnd = hwnd;
+        }
+
+        public void NotifySystemResume()
+        {
+            lastResumeUtc = DateTime.UtcNow;
+            try { GpuVramMonitor.NotifyDisplayOrPowerReset(); } catch { }
+            try { VirtualDesktopShield.InvalidateCache(); } catch { }
+            Log.Info("System resume or display reset detected; refreshing telemetry and pausing Auto-Guard for 15s.");
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    Thread.Sleep(1500);
+                    if (!disposed) RefreshCalmScreenAsync(true);
+                }
+                catch { }
+            });
+        }
+
+        public void SwitchToDesktop(int targetDesktopNumber)
+        {
+            if (disposed) return;
+            VirtualDesktopShield.InvalidateCache();
+            VirtualDesktopShield.SwitchToDesktopNumber(targetDesktopNumber, legramWindowHwnd, delegate
+            {
+                VirtualDesktopShield.InvalidateCache();
+                VirtualDesktopState vd = VirtualDesktopShield.SampleAndFollow(legramWindowHwnd, true);
+                HandleVirtualDesktopStateChange(vd);
+                RefreshCalmScreenAsync(false);
+            });
+        }
+
+        public void CreateNewDesktop()
+        {
+            if (disposed) return;
+            VirtualDesktopShield.InvalidateCache();
+            VirtualDesktopShield.CreateNewDesktopAndSwitch(legramWindowHwnd, delegate
+            {
+                VirtualDesktopShield.InvalidateCache();
+                VirtualDesktopState vd = VirtualDesktopShield.SampleAndFollow(legramWindowHwnd, true);
+                HandleVirtualDesktopStateChange(vd);
+                RefreshCalmScreenAsync(false);
+            });
+        }
+
+        public void CloseCurrentDesktop()
+        {
+            if (disposed) return;
+            VirtualDesktopShield.InvalidateCache();
+            VirtualDesktopShield.CloseCurrentDesktop(legramWindowHwnd, delegate
+            {
+                VirtualDesktopShield.InvalidateCache();
+                VirtualDesktopState vd = VirtualDesktopShield.SampleAndFollow(legramWindowHwnd, true);
+                HandleVirtualDesktopStateChange(vd);
+                RefreshCalmScreenAsync(false);
+            });
+        }
+
+        private void OnForegroundSwitchedFromHook(object sender, EventArgs e)
+        {
+            if (disposed || IsBusy) return;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    VirtualDesktopShield.InvalidateCache();
+                    VirtualDesktopState vd = VirtualDesktopShield.SampleAndFollow(legramWindowHwnd, true);
+                    HandleVirtualDesktopStateChange(vd);
+                }
+                catch { }
+            });
+        }
+
+        private void HandleVirtualDesktopStateChange(VirtualDesktopState vd)
+        {
+            if (vd == null) return;
+            int prevDesk = lastObservedDesktopNumber;
+            bool switched = (vd.ActiveDesktopNumber != prevDesk);
+            lastObservedDesktopNumber = vd.ActiveDesktopNumber;
+
+            if (!switched) return;
+
+            // Update snapshot immediately so the Desk badge reflects the new desktop in < 5 ms!
+            lock (stateLock)
+            {
+                if (currentSnapshot != null)
+                {
+                    currentSnapshot.ActiveDesktopNumber = vd.ActiveDesktopNumber;
+                    currentSnapshot.TotalDesktopCount = vd.TotalDesktopCount;
+                    currentSnapshot.ActiveDesktopName = vd.ActiveDesktopName;
+                }
+            }
+            EventHandler ev = SnapshotUpdated;
+            if (ev != null) ev(this, EventArgs.Empty);
+
+            // Schedule smooth 1.2s post-animation settle pass to Eco-Sleep & gently trim the desktop we just left
+            int gen = Interlocked.Increment(ref desktopSwitchGeneration);
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                Thread.Sleep(1250); // Wait for Windows 250-350ms slide animation to finish 100% smoothly
+                if (disposed || gen != Volatile.Read(ref desktopSwitchGeneration)) return;
+                ExecuteSmoothDesktopSettleSleep(prevDesk);
+            });
+        }
+
+        // Runs 1.25s after switching desktops: applies EcoQoS to inactive desktop apps + gentle 1-shot RAM trim (45s cooldown per desktop)
+        public int ExecuteSmoothDesktopSettleSleep(int previousDesktopNumber)
+        {
+            if (disposed || IsBusy) return 0;
+            if (settings != null && !settings.VirtualDesktopSleepEnabled)
+            {
+                RefreshCalmScreenAsync(true);
+                return 0;
+            }
+
+            try
+            {
+                VirtualDesktopState vd = VirtualDesktopShield.SampleAndFollow(legramWindowHwnd, true);
+                HashSet<string> userImmune = settings != null ? settings.SnapshotImmuneGroups() : null;
+                bool gameAutoPause = settings == null || settings.GameModeAutoPause;
+                GuardScanResult guard = ProcessGuard.Scan(null, null, false, userImmune, gameAutoPause, vd);
+
+                // Reconcile EcoQoS (instantly wakes apps on the new active desktop and puts previous desktop apps into EcoQoS)
+                if (ecoQos != null)
+                {
+                    ecoQos.VirtualDesktopSleep = settings == null || settings.VirtualDesktopSleepEnabled;
+                    ecoQos.ReconcileAndSnapshot(guard);
+                }
+
+                // Check 45-second cooldown before trimming working sets of the desktop we left (prevents white window flash on quick back-and-forth)
+                bool allowTrim = true;
+                lock (lastTrimUtcByDesktop)
+                {
+                    DateTime lastTrim;
+                    if (lastTrimUtcByDesktop.TryGetValue(previousDesktopNumber, out lastTrim)
+                        && (DateTime.UtcNow - lastTrim).TotalSeconds < 45)
+                    {
+                        allowTrim = false;
+                    }
+                    else
+                    {
+                        lastTrimUtcByDesktop[previousDesktopNumber] = DateTime.UtcNow;
+                    }
+                }
+
+                GpuSnapshot gpuLight = GpuVramMonitor.SampleLightweight();
+                int trimmed = 0;
+                long availBefore = ReadAvailableRamBytes();
+                if (allowTrim && !guard.GameShieldActive && !(guard.RenderAppPresent && gpuLight.IsRenderingOrDecoding) && vd.TotalDesktopCount > 1)
+                {
+                    foreach (int pid in guard.InactiveDesktopSleepPids)
+                    {
+                        ProcNode n;
+                        if (!guard.Nodes.TryGetValue(pid, out n)) continue;
+                        // Trim inactive-desktop processes holding >= 24 MB so RAM is reclaimed smoothly
+                        if (n.WorkingSetBytes < 24L * 1024 * 1024) continue;
+                        bool keepLow = (ecoQos != null && ecoQos.IsPidThrottled(pid));
+                        if (TrimSingleProcessSafe(pid, true, keepLow))
+                        {
+                            trimmed++;
+                            Thread.Sleep(4); // Micro-pacing so memory controller never spikes
+                        }
+                    }
+                }
+                if (trimmed > 0)
+                {
+                    Thread.Sleep(45);
+                    long freed = Math.Max(0L, ReadAvailableRamBytes() - availBefore);
+                    Log.Info("Desktop switch settle (from Desk " + previousDesktopNumber + " -> Desk " + vd.ActiveDesktopNumber + "): EcoQoS + trimmed " + trimmed + " procs (+" + Fmt.BytesShort(freed) + ")");
+                }
+
+                RefreshCalmScreenAsync(true);
+                return trimmed;
+            }
+            catch
+            {
+                return 0;
+            }
         }
 
         public void Start()
@@ -76,19 +275,32 @@ namespace Legram
             if (disposed) return;
             try
             {
-                if (!settings.AutoGuardEnabled || (DateTime.UtcNow - bootUtc).TotalSeconds < 5)
+                if (!settings.AutoGuardEnabled
+                    || (DateTime.UtcNow - bootUtc).TotalSeconds < 5
+                    || (DateTime.UtcNow - lastResumeUtc).TotalSeconds < 15)
                 {
                     Thread.Sleep(5000);
                     return;
                 }
-                if ((DateTime.UtcNow - lastAutoPurgeUtc).TotalSeconds < 90)
+                SystemSnapshot curSnap = Current;
+                if (curSnap != null && (curSnap.GameShieldActive || curSnap.RenderShieldActive))
+                {
+                    Thread.Sleep(5000);
+                    return;
+                }
+                if (curSnap != null && curSnap.AvailableRamBytes > 2500L * 1024 * 1024 && !curSnap.IsCommitCritical)
+                {
+                    Thread.Sleep(5000);
+                    return;
+                }
+                if ((DateTime.UtcNow - lastAutoPurgeUtc).TotalSeconds < 120)
                 {
                     Thread.Sleep(5000);
                     return;
                 }
 
                 lastAutoPurgeUtc = DateTime.UtcNow;
-                PurgeResult res = ExecutePurgeCore(true);
+                PurgeResult res = ExecutePurgeCore(true, true, "Auto-Guard");
                 if (res.Success && res.FreedRamBytes > 32L * 1024 * 1024)
                 {
                     EventHandler<PurgeCompletedEventArgs> h = AutoPurgeCompleted;
@@ -107,9 +319,10 @@ namespace Legram
         }
 
         // Evaluates smart anti-stutter & OOM auto-harmony conditions (RAM >84%, Commit >=88%, or ISLC Standby Saturated)
+        // Automatically pauses when Game Mode (Fullscreen Game) or Creative Render Shield is active!
         public static string EvaluateAutoGuardTrigger(SystemSnapshot snap)
         {
-            if (snap == null || snap.RenderShieldActive) return null;
+            if (snap == null || snap.RenderShieldActive || snap.GameShieldActive) return null;
             if (snap.AvailableRamBytes > 0 && snap.AvailableRamBytes < 2500L * 1024 * 1024 && snap.UsedRamPercent >= 84)
             {
                 return "Low RAM (" + snap.UsedRamPercent + "%)";
@@ -136,20 +349,34 @@ namespace Legram
 
             // Smart anti-stutter threshold check (RAM >84%, Commit >=88%, or ISLC Standby >=4GB & Free <1GB) after 5s boot grace
             string autoReason = EvaluateAutoGuardTrigger(snap);
+            if (autoReason != null && autoReason.StartsWith("ISLC Standby", StringComparison.Ordinal)
+                && !snap.KernelPurgeTaskReady && snap.AvailableRamBytes >= 2500L * 1024 * 1024)
+            {
+                autoReason = null;
+            }
             if (settings.AutoGuardEnabled && !IsBusy
                 && autoReason != null
                 && (DateTime.UtcNow - bootUtc).TotalSeconds >= 5
+                && (DateTime.UtcNow - lastResumeUtc).TotalSeconds >= 15
                 && (DateTime.UtcNow - lastAutoPurgeUtc).TotalSeconds >= 120)
             {
                 lastAutoPurgeUtc = DateTime.UtcNow;
+                string reasonCopy = autoReason;
                 ThreadPool.QueueUserWorkItem(delegate
                 {
-                    PurgeResult r = ExecutePurgeCore(true);
-                    r.TriggerReason = autoReason;
-                    if (r.Success && r.FreedRamBytes > 48L * 1024 * 1024)
+                    try
                     {
-                        EventHandler<PurgeCompletedEventArgs> h = AutoPurgeCompleted;
-                        if (h != null) h(this, new PurgeCompletedEventArgs(r));
+                        PurgeResult r = ExecutePurgeCore(true, true, reasonCopy);
+                        r.TriggerReason = reasonCopy;
+                        if (r.Success && r.FreedRamBytes > 48L * 1024 * 1024)
+                        {
+                            EventHandler<PurgeCompletedEventArgs> h = AutoPurgeCompleted;
+                            if (h != null) h(this, new PurgeCompletedEventArgs(r));
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error("AutoGuard Trigger", ex);
                     }
                 });
             }
@@ -161,7 +388,11 @@ namespace Legram
 
         public void RefreshSnapshotAsync(bool forceJunkRescan)
         {
-            ThreadPool.QueueUserWorkItem(delegate { RefreshSnapshot(forceJunkRescan); });
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try { RefreshSnapshot(forceJunkRescan); }
+                catch (Exception ex) { Log.Error("RefreshSnapshotAsync", ex); }
+            });
         }
 
         private int calmTickCount;
@@ -171,19 +402,26 @@ namespace Legram
         {
             ThreadPool.QueueUserWorkItem(delegate
             {
-                if (disposed || IsBusy) return;
-                int tick = Interlocked.Increment(ref calmTickCount);
-                if (immediateFull || tick % 4 == 0)
+                try
                 {
-                    SystemSnapshot snap = BuildSnapshotCore(false, false);
-                    lock (stateLock) { currentSnapshot = snap; }
-                    EventHandler ev = SnapshotUpdated;
-                    if (ev != null) ev(this, EventArgs.Empty);
-                    GC.Collect(1, GCCollectionMode.Optimized, false);
-                    NativeApi.SelfTrimWorkingSet();
-                    return;
+                    if (disposed || IsBusy) return;
+                    int tick = Interlocked.Increment(ref calmTickCount);
+                    if (immediateFull || tick % 4 == 0)
+                    {
+                        SystemSnapshot snap = BuildSnapshotCore(false, false);
+                        lock (stateLock) { currentSnapshot = snap; }
+                        EventHandler ev = SnapshotUpdated;
+                        if (ev != null) ev(this, EventArgs.Empty);
+                        GC.Collect(1, GCCollectionMode.Optimized, false);
+                        NativeApi.SelfTrimWorkingSet();
+                        return;
+                    }
+                    RefreshLightweightInline();
                 }
-                RefreshLightweightInline();
+                catch (Exception ex)
+                {
+                    Log.Error("RefreshCalmScreenAsync", ex);
+                }
             });
         }
 
@@ -194,22 +432,29 @@ namespace Legram
         {
             ThreadPool.QueueUserWorkItem(delegate
             {
-                if (disposed || IsBusy) return;
-                int tick = Interlocked.Increment(ref lightTickCount);
-
-                // Every 8th idle tick (~32s), run background EcoQoS reconcile without PDH overhead
-                if (tick % 8 == 0)
+                try
                 {
-                    SystemSnapshot ecoSnap = BuildSnapshotCore(false, false);
-                    lock (stateLock) { currentSnapshot = ecoSnap; }
-                    EventHandler ev2 = SnapshotUpdated;
-                    if (ev2 != null) ev2(this, EventArgs.Empty);
-                    GC.Collect(1, GCCollectionMode.Optimized, false);
-                    NativeApi.SelfTrimWorkingSet();
-                    return;
-                }
+                    if (disposed || IsBusy) return;
+                    int tick = Interlocked.Increment(ref lightTickCount);
 
-                RefreshLightweightInline();
+                    // Every 8th idle tick (~32s), run background EcoQoS reconcile without PDH overhead
+                    if (tick % 8 == 0)
+                    {
+                        SystemSnapshot ecoSnap = BuildSnapshotCore(false, false);
+                        lock (stateLock) { currentSnapshot = ecoSnap; }
+                        EventHandler ev2 = SnapshotUpdated;
+                        if (ev2 != null) ev2(this, EventArgs.Empty);
+                        GC.Collect(1, GCCollectionMode.Optimized, false);
+                        NativeApi.SelfTrimWorkingSet();
+                        return;
+                    }
+
+                    RefreshLightweightInline();
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("RefreshLightweightAsync", ex);
+                }
             });
         }
 
@@ -285,6 +530,23 @@ namespace Legram
                 }
             }
 
+            bool gameActiveNow = prev.GameShieldActive;
+            if (settings.GameModeAutoPause)
+            {
+                bool d3dEx;
+                if (NativeApi.IsForegroundWindowFullscreen(NativeApi.GetForegroundWindow(), out d3dEx) && d3dEx)
+                {
+                    gameActiveNow = true;
+                }
+            }
+            else
+            {
+                gameActiveNow = false;
+            }
+
+            VirtualDesktopState vdLight = VirtualDesktopShield.SampleLightweightCached(legramWindowHwnd);
+            lastObservedDesktopNumber = vdLight.ActiveDesktopNumber;
+
             SystemSnapshot next = new SystemSnapshot
             {
                 InstalledDimmBytes = prev.InstalledDimmBytes,
@@ -303,6 +565,14 @@ namespace Legram
                 UsedRamPercent = usedPct,
                 Pressure = p,
                 RenderShieldActive = prev.RenderShieldActive || gpu.IsRenderingOrDecoding,
+                GameShieldActive = gameActiveNow,
+                ActiveGameName = prev.ActiveGameName,
+                UserImmuneGroupCount = prev.UserImmuneGroupCount,
+                ActiveDesktopNumber = vdLight.ActiveDesktopNumber,
+                TotalDesktopCount = vdLight.TotalDesktopCount,
+                ActiveDesktopName = vdLight.ActiveDesktopName,
+                SleepingDesktopAppCount = prev.SleepingDesktopAppCount,
+                VirtualDesktopTooltipSummary = prev.VirtualDesktopTooltipSummary,
                 KernelPurgeTaskReady = prev.KernelPurgeTaskReady,
                 ProtectedProcessCount = prev.ProtectedProcessCount,
                 TcpListenerCount = prev.TcpListenerCount,
@@ -321,17 +591,25 @@ namespace Legram
                 TopGroups = prev.TopGroups
             };
 
+            StampSessionTelemetry(next);
             lock (stateLock) { currentSnapshot = next; }
 
             string autoReason = EvaluateAutoGuardTrigger(next);
+            if (autoReason != null && autoReason.StartsWith("ISLC Standby", StringComparison.Ordinal)
+                && !next.KernelPurgeTaskReady && next.AvailableRamBytes >= 2500L * 1024 * 1024)
+            {
+                autoReason = null;
+            }
             if (settings.AutoGuardEnabled && !IsBusy
                 && autoReason != null
                 && (DateTime.UtcNow - bootUtc).TotalSeconds >= 5
+                && (DateTime.UtcNow - lastResumeUtc).TotalSeconds >= 15
                 && !gpu.IsRenderingOrDecoding
+                && !next.GameShieldActive
                 && (DateTime.UtcNow - lastAutoPurgeUtc).TotalSeconds >= 120)
             {
                 lastAutoPurgeUtc = DateTime.UtcNow;
-                PurgeResult r = ExecutePurgeCore(true);
+                PurgeResult r = ExecutePurgeCore(true, true, autoReason);
                 r.TriggerReason = autoReason;
                 if (r.Success && r.FreedRamBytes > 48L * 1024 * 1024)
                 {
@@ -441,8 +719,16 @@ namespace Legram
             Dictionary<int, long> vramByPid = null;
             snap.Gpu = includePdh ? GpuVramMonitor.Sample(out vramByPid) : GpuVramMonitor.SampleLightweight();
 
-            // 3. ProcessGuard + EcoQoS Reconcile
-            GuardScanResult guard = ProcessGuard.Scan(vramByPid, null, snap.Gpu.IsRenderingOrDecoding);
+            // 3. Virtual Desktop State + ProcessGuard + EcoQoS Reconcile (with User Whitelist & Game Mode Auto-Pause)
+            VirtualDesktopState vdState = VirtualDesktopShield.SampleAndFollow(legramWindowHwnd, true);
+            lastObservedDesktopNumber = vdState.ActiveDesktopNumber;
+            HashSet<string> userImmune = settings != null ? settings.SnapshotImmuneGroups() : null;
+            bool gameAutoPause = settings == null || settings.GameModeAutoPause;
+            if (ecoQos != null)
+            {
+                ecoQos.VirtualDesktopSleep = settings == null || settings.VirtualDesktopSleepEnabled;
+            }
+            GuardScanResult guard = ProcessGuard.Scan(vramByPid, null, snap.Gpu.IsRenderingOrDecoding, userImmune, gameAutoPause, vdState);
             HashSet<int> throttled = ecoQos.ReconcileAndSnapshot(guard);
             if (throttled.Count > 0)
             {
@@ -450,6 +736,7 @@ namespace Legram
                 for (int i = 0; i < guard.TopGroups.Count; i++)
                 {
                     ProcessGroupItem g = guard.TopGroups[i];
+                    if (g.IsUserWhitelisted) continue;
                     for (int k = 0; k < g.Pids.Count; k++)
                     {
                         if (throttled.Contains(g.Pids[k]))
@@ -462,6 +749,14 @@ namespace Legram
             }
 
             snap.RenderShieldActive = guard.RenderAppPresent && snap.Gpu.IsRenderingOrDecoding;
+            snap.GameShieldActive = guard.GameShieldActive;
+            snap.ActiveGameName = guard.ActiveGameName;
+            snap.UserImmuneGroupCount = guard.UserImmuneGroupCount;
+            snap.ActiveDesktopNumber = guard.ActiveDesktopNumber;
+            snap.TotalDesktopCount = guard.TotalDesktopCount;
+            snap.ActiveDesktopName = guard.ActiveDesktopName;
+            snap.SleepingDesktopAppCount = guard.SleepingDesktopAppCount;
+            snap.VirtualDesktopTooltipSummary = guard.VirtualDesktopTooltipSummary;
             snap.ProtectedProcessCount = guard.ProtectedPids.Count;
             snap.TcpListenerCount = guard.TcpListenerCount;
             snap.ActiveAudioCount = guard.ActiveAudioPids.Count;
@@ -484,15 +779,49 @@ namespace Legram
             // 5. Check Scheduled Task status (cached every 30s)
             snap.KernelPurgeTaskReady = IsKernelPurgeTaskRegistered();
 
+            StampSessionTelemetry(snap);
             return snap;
+        }
+
+        private void RecordSessionHarmonize(string triggerLabel, long totalFreedBytes, int durationMs)
+        {
+            if (totalFreedBytes < 0L) totalFreedBytes = 0L;
+            string label = string.IsNullOrEmpty(triggerLabel) ? "Harmonize" : triggerLabel;
+            string timeStr = DateTime.Now.ToString("HH:mm");
+            string gainText = totalFreedBytes >= 8L * 1024 * 1024
+                ? ("+" + Fmt.BytesShort(totalFreedBytes))
+                : "Optimal";
+            string summary = label + " " + timeStr + " \u00B7 " + gainText + " (" + durationMs + " ms)";
+            lock (stateLock)
+            {
+                sessionHarmonizeCount++;
+                sessionTotalFreedBytes += totalFreedBytes;
+                lastHarmonizeSummary = summary;
+            }
+        }
+
+        private void StampSessionTelemetry(SystemSnapshot snap)
+        {
+            if (snap == null) return;
+            lock (stateLock)
+            {
+                snap.LastHarmonizeSummary = lastHarmonizeSummary;
+                snap.SessionTotalFreedBytes = sessionTotalFreedBytes;
+                snap.SessionHarmonizeCount = sessionHarmonizeCount;
+            }
         }
 
         public Task<PurgeResult> RunManualPurgeAsync()
         {
-            return Task.Run(delegate { return ExecutePurgeCore(false); });
+            return Task.Run(delegate { return ExecutePurgeCore(false, true, "Manual"); });
         }
 
         private PurgeResult ExecutePurgeCore(bool gentleAutoMode)
+        {
+            return ExecutePurgeCore(gentleAutoMode, true, gentleAutoMode ? "Auto-Guard" : "Manual");
+        }
+
+        private PurgeResult ExecutePurgeCore(bool gentleAutoMode, bool recordTelemetry, string triggerLabel)
         {
             PurgeResult result = new PurgeResult();
             if (!purgeGate.Wait(gentleAutoMode ? 0 : 2500))
@@ -506,25 +835,42 @@ namespace Legram
             try
             {
                 long availBefore = ReadAvailableRamBytes();
+                long freeZeroBefore;
+                long standbyBefore;
+                ReadFreeZeroAndStandbyBytes(out freeZeroBefore, out standbyBefore);
+                bool allowFullStandbyEmergency = standbyBefore >= 4096L * 1048576L
+                    && freeZeroBefore > 0
+                    && freeZeroBefore < 1024L * 1048576L;
 
                 GpuSnapshot gpu = GpuVramMonitor.SampleLightweight();
-                GuardScanResult guard = ProcessGuard.Scan(null, null, gpu.IsRenderingOrDecoding);
+                HashSet<string> userImmune = settings != null ? settings.SnapshotImmuneGroups() : null;
+                bool gameAutoPause = settings == null || settings.GameModeAutoPause;
+                GuardScanResult guard = ProcessGuard.Scan(null, null, gpu.IsRenderingOrDecoding, userImmune, gameAutoPause);
 
-                // 1. Lower MemoryPriority to Low (2) -> K32EmptyWorkingSet on non-guarded background processes
+                if (gentleAutoMode && (guard.GameShieldActive || (guard.RenderAppPresent && gpu.IsRenderingOrDecoding)))
+                {
+                    result.Success = false;
+                    result.SummaryText = "Game/Render Shield Paused";
+                    return result;
+                }
+
+                // 1. Temporarily lower MemoryPriority to Low (2) -> K32EmptyWorkingSet -> restore original MemoryPriority (micro-paced for Win11 24H2/25H2)
                 int trimmed = 0;
                 for (int i = 0; i < guard.TrimmablePids.Count; i++)
                 {
                     int pid = guard.TrimmablePids[i];
                     if (guard.ProtectedPids.Contains(pid)) continue;
-                    if (TrimSingleProcessSafe(pid, true))
+                    bool keepLow = (ecoQos != null && ecoQos.IsPidThrottled(pid));
+                    if (TrimSingleProcessSafe(pid, true, keepLow))
                     {
                         trimmed++;
+                        if (trimmed > 0 && (trimmed % 10) == 0) Thread.Sleep(2);
                     }
                 }
                 result.TrimmedProcessCount = trimmed;
 
-                // 2. Deflate bloated dwm.exe safely (K32EmptyWorkingSet ONLY — never touches priority/QoS, skipped during GPU render)
-                if (!gpu.IsRenderingOrDecoding && guard.DwmPid > 4)
+                // 2. Deflate bloated dwm.exe safely (K32EmptyWorkingSet ONLY — never touches priority/QoS, skipped during GPU render or Game Mode)
+                if (!gpu.IsRenderingOrDecoding && !guard.GameShieldActive && guard.DwmPid > 4)
                 {
                     long dwmThreshold = gentleAutoMode ? (650L * 1048576L) : (450L * 1048576L);
                     long dwmFreed;
@@ -541,26 +887,31 @@ namespace Legram
                 result.RegistryCacheFlushed = regFlushed;
                 result.SystemCacheTrimmed = sysCacheTrimmed;
 
-                // 4. Try Direct or Helper-Task Kernel Page Combine + Low-Priority Standby Purge (0 FlushModifiedList = 0 Stutter)
-                bool kernelPurged = TryDirectKernelCombineAndStandbyPurge();
+                // 4. Try Direct or Helper-Task Kernel Page Combine (10-min auto cooldown) + Low-Priority Standby Purge (+ ISLC Emergency Cmd=4 when saturated)
+                bool runCombine = !gentleAutoMode || (DateTime.UtcNow - lastAutoCombineUtc).TotalMinutes >= 10.0;
+                if (runCombine)
+                {
+                    lastAutoCombineUtc = DateTime.UtcNow;
+                }
+                long combinedBytes;
+                bool kernelPurged = TryDirectKernelCombineAndStandbyPurge(allowFullStandbyEmergency, runCombine, out combinedBytes);
                 if (!kernelPurged && IsKernelPurgeTaskRegistered())
                 {
                     kernelPurged = TriggerScheduledPurgeHelper();
                 }
                 result.KernelStandbyPurged = kernelPurged;
+                result.CombinedBytes = combinedBytes;
 
-                // 5. Flush DNS Resolver Cache (3 ms)
-                if (!gentleAutoMode)
-                {
-                    try { NativeApi.DnsFlushResolverCache(); } catch { }
-                }
+                // Note: Intentionally never flushes Windows DNS Resolver Cache so active browser/app network connections experience 0 DNS lookup latency!
 
-                // Brief settle (65 ms) so OS page accounting updates Available Physical Memory
+                // Brief settle (65 ms) so OS page accounting updates Available Physical Memory & Free/Zeroed lists
                 Thread.Sleep(65);
 
                 long availAfter = ReadAvailableRamBytes();
+                long freeZeroAfter = ReadFreeZeroRamBytes();
                 long delta = Math.Max(0L, availAfter - availBefore);
                 result.FreedRamBytes = delta;
+                result.StandbyZeroedBytes = Math.Max(0L, freeZeroAfter - freeZeroBefore);
                 result.Success = true;
                 sw.Stop();
                 result.DurationMs = (int)sw.ElapsedMilliseconds;
@@ -574,6 +925,11 @@ namespace Legram
                 {
                     result.PillToastText = "RAM Optimal";
                     result.SummaryText = "\u2713 RAM Already Optimal \u00B7 " + trimmed + " procs trimmed";
+                }
+
+                if (recordTelemetry)
+                {
+                    RecordSessionHarmonize(triggerLabel, delta, result.DurationMs);
                 }
 
                 Log.Info("Purge completed (" + (gentleAutoMode ? "auto" : "manual") + "): " + result.SummaryText);
@@ -601,24 +957,28 @@ namespace Legram
             return Task.Run(delegate
             {
                 PurgeResult r = new PurgeResult();
-                if (group == null || group.IsProtected) return r;
+                if (group == null || group.IsProtected || group.IsUserWhitelisted) return r;
                 Stopwatch sw = Stopwatch.StartNew();
                 long before = ReadAvailableRamBytes();
 
                 int count = 0;
+                long wslReclaimed = 0L;
                 if (group.IsOrphanGroup)
                 {
                     for (int i = 0; i < group.Pids.Count; i++)
                     {
                         if (TerminatePidSafe(group.Pids[i])) count++;
                     }
-                    TryShutdownIdleWsl();
+                    wslReclaimed = ReclaimWslMemorySafe(true);
+                    if (wslReclaimed > 0) count++;
                 }
                 else
                 {
                     for (int i = 0; i < group.Pids.Count; i++)
                     {
-                        if (TrimSingleProcessSafe(group.Pids[i], true)) count++;
+                        int pid = group.Pids[i];
+                        bool keepLow = (ecoQos != null && ecoQos.IsPidThrottled(pid));
+                        if (TrimSingleProcessSafe(pid, true, keepLow)) count++;
                     }
                 }
 
@@ -627,11 +987,12 @@ namespace Legram
                 sw.Stop();
                 r.Success = true;
                 r.FreedRamBytes = delta;
+                r.WslReclaimedBytes = wslReclaimed;
                 r.TrimmedProcessCount = count;
                 r.DurationMs = (int)sw.ElapsedMilliseconds;
                 r.PillToastText = delta > 8L * 1024 * 1024 ? ("+" + Fmt.BytesShort(delta) + " freed") : (group.DisplayName + " trimmed");
                 r.SummaryText = "\u2713 " + group.DisplayName + ": +" + Fmt.BytesShort(Math.Max(delta, 1024 * 1024));
-                RefreshSnapshot(false);
+                RefreshCalmScreenAsync(true);
                 return r;
             });
         }
@@ -645,7 +1006,9 @@ namespace Legram
                 long ramBefore = ReadAvailableRamBytes();
                 Dictionary<int, long> vramBeforeMap;
                 GpuSnapshot gpuBefore = GpuVramMonitor.Sample(out vramBeforeMap);
-                GuardScanResult guard = ProcessGuard.Scan(vramBeforeMap, null, gpuBefore.IsRenderingOrDecoding);
+                HashSet<string> userImmune = settings != null ? settings.SnapshotImmuneGroups() : null;
+                bool gameAutoPause = settings == null || settings.GameModeAutoPause;
+                GuardScanResult guard = ProcessGuard.Scan(vramBeforeMap, null, gpuBefore.IsRenderingOrDecoding, userImmune, gameAutoPause);
 
                 int reaped = 0;
                 // 1. Reap verified orphan AI child processes
@@ -654,21 +1017,22 @@ namespace Legram
                     if (TerminatePidSafe(guard.OrphanAiPids[i])) reaped++;
                 }
 
-                // 2. Evict idle Ollama VRAM models safely (keep_alive: 0)
-                int unloadedOllama = GpuVramMonitor.EvictIdleOllamaModels(gpuBefore.IsRenderingOrDecoding || gpuBefore.GpuUtilPercent >= 10);
+                // 2. Evict idle AI VRAM models safely (Ollama + LM Studio + ComfyUI)
+                int unloadedAi = GpuVramMonitor.EvictAllIdleAiModels(gpuBefore.IsRenderingOrDecoding || guard.GameShieldActive || gpuBefore.GpuUtilPercent >= 10);
 
-                // 3. Shutdown WSL VM if idle
-                if (TryShutdownIdleWsl()) reaped++;
+                // 3. Reclaim WSL2 Linux page caches non-destructively (+ shutdown only if zero WSL/Docker clients exist)
+                long wslReclaimed = ReclaimWslMemorySafe(true);
+                if (wslReclaimed > 0) reaped++;
 
-                // 4. Refresh bloated Chromium/Browser --type=gpu-process ONLY if not rendering/decoding/playing audio
-                if (!gpuBefore.IsRenderingOrDecoding && guard.ActiveAudioPids.Count == 0)
+                // 4. Gently trim working set of bloated Chromium/Browser --type=gpu-process (NEVER kill, 0 screen blink / 0 WebRTC reset!)
+                if (!gpuBefore.IsRenderingOrDecoding && !guard.GameShieldActive && guard.ActiveAudioPids.Count == 0)
                 {
                     for (int i = 0; i < gpuBefore.RefreshableBrowserGpuPids.Count; i++)
                     {
                         int gpuPid = gpuBefore.RefreshableBrowserGpuPids[i];
                         if (!guard.ProtectedPids.Contains(gpuPid))
                         {
-                            if (TerminatePidSafe(gpuPid)) reaped++;
+                            if (TrimSingleProcessSafe(gpuPid, false)) reaped++;
                         }
                     }
                 }
@@ -683,8 +1047,10 @@ namespace Legram
                 r.Success = true;
                 r.FreedVramBytes = vramDelta;
                 r.FreedRamBytes = ramDelta;
+                r.WslReclaimedBytes = wslReclaimed;
                 r.ReapedOrphanCount = reaped;
-                r.UnloadedOllamaModels = unloadedOllama;
+                r.UnloadedAiTargets = unloadedAi;
+                r.UnloadedOllamaModels = unloadedAi;
                 r.DurationMs = (int)sw.ElapsedMilliseconds;
                 long combined = vramDelta + ramDelta;
                 r.PillToastText = combined > 16L * 1024 * 1024 ? ("VRAM +" + Fmt.BytesShort(combined)) : "VRAM & AI Fresh";
@@ -718,7 +1084,7 @@ namespace Legram
             });
         }
 
-        // THE ONE BUTTON: Unified Harmony Pass (RAM + Registry/SysCache + DWM Leak + Safe VRAM/Ollama/AI Orphans + Safe SSD Junk)
+        // THE ONE BUTTON: Unified Harmony Pass (RAM + Registry/SysCache + DWM Leak + Non-Destructive WSL2 + Safe VRAM/AI Orphans + Safe SSD Junk)
         public Task<PurgeResult> RunUnifiedHarmonyAsync()
         {
             return Task.Run(delegate
@@ -727,35 +1093,39 @@ namespace Legram
                 long ramBefore = ReadAvailableRamBytes();
 
                 // 1. Core RAM Working-Set + DWM Leak + Registry/SysCache + Page Combine + 0-UAC Kernel Low-Prio Standby Purge
-                PurgeResult core = ExecutePurgeCore(false);
+                PurgeResult core = ExecutePurgeCore(false, false, "Harmonize");
 
-                // 2. Opportunistic Orphan AI, Idle Ollama VRAM Evict & Safe GPU Browser Compositor Refresh (0 disruption to audio/render)
+                // 2. Opportunistic Orphan AI, Idle AI VRAM Evict (Ollama + LM Studio + ComfyUI), Non-Destructive WSL2 Reclaim & Gentle Browser GPU Trim
                 long vramFreed = 0;
+                long wslReclaimed = 0;
                 int reaped = 0;
-                int unloadedOllama = 0;
+                int unloadedAi = 0;
                 try
                 {
                     Dictionary<int, long> vramBeforeMap;
                     GpuSnapshot gpuBefore = GpuVramMonitor.Sample(out vramBeforeMap);
-                    GuardScanResult guard = ProcessGuard.Scan(vramBeforeMap, null, gpuBefore.IsRenderingOrDecoding);
+                    HashSet<string> userImmune = settings != null ? settings.SnapshotImmuneGroups() : null;
+                    bool gameAutoPause = settings == null || settings.GameModeAutoPause;
+                    GuardScanResult guard = ProcessGuard.Scan(vramBeforeMap, null, gpuBefore.IsRenderingOrDecoding, userImmune, gameAutoPause);
 
                     for (int i = 0; i < guard.OrphanAiPids.Count; i++)
                     {
                         if (TerminatePidSafe(guard.OrphanAiPids[i])) reaped++;
                     }
-                    unloadedOllama = GpuVramMonitor.EvictIdleOllamaModels(gpuBefore.IsRenderingOrDecoding || gpuBefore.GpuUtilPercent >= 10);
+                    unloadedAi = GpuVramMonitor.EvictAllIdleAiModels(gpuBefore.IsRenderingOrDecoding || guard.GameShieldActive || gpuBefore.GpuUtilPercent >= 10);
+                    wslReclaimed = ReclaimWslMemorySafe(false);
 
-                    if (!gpuBefore.IsRenderingOrDecoding && guard.ActiveAudioPids.Count == 0
+                    if (!gpuBefore.IsRenderingOrDecoding && !guard.GameShieldActive && guard.ActiveAudioPids.Count == 0
                         && gpuBefore.RefreshableBrowserGpuPids.Count > 0
                         && (gpuBefore.IsHighAlert || gpuBefore.ReclaimableVramBytes >= 192L * 1024 * 1024))
                     {
                         for (int i = 0; i < gpuBefore.RefreshableBrowserGpuPids.Count; i++)
                         {
                             int gpuPid = gpuBefore.RefreshableBrowserGpuPids[i];
-                            if (!guard.ProtectedPids.Contains(gpuPid) && TerminatePidSafe(gpuPid)) reaped++;
+                            if (!guard.ProtectedPids.Contains(gpuPid) && TrimSingleProcessSafe(gpuPid, false)) reaped++;
                         }
                     }
-                    if (reaped > 0 || unloadedOllama > 0)
+                    if (reaped > 0 || unloadedAi > 0)
                     {
                         Thread.Sleep(140);
                         Dictionary<int, long> vramAfterMap;
@@ -796,11 +1166,15 @@ namespace Legram
                 {
                     Success = core.Success,
                     FreedRamBytes = ramDelta,
+                    StandbyZeroedBytes = core.StandbyZeroedBytes,
+                    CombinedBytes = core.CombinedBytes,
+                    WslReclaimedBytes = wslReclaimed,
                     FreedVramBytes = vramFreed,
                     FreedDiskBytes = diskFreed,
                     TrimmedProcessCount = core.TrimmedProcessCount,
                     ReapedOrphanCount = reaped,
-                    UnloadedOllamaModels = unloadedOllama,
+                    UnloadedAiTargets = unloadedAi,
+                    UnloadedOllamaModels = unloadedAi,
                     KernelStandbyPurged = core.KernelStandbyPurged,
                     RegistryCacheFlushed = core.RegistryCacheFlushed,
                     SystemCacheTrimmed = core.SystemCacheTrimmed,
@@ -830,6 +1204,8 @@ namespace Legram
                     res.PillToastText = "Harmonized";
                     res.SummaryText = "Already Optimal \u00B7 " + core.TrimmedProcessCount + " Procs Trimmed";
                 }
+
+                RecordSessionHarmonize("Harmonize", totalMemGain + diskFreed, res.DurationMs);
 
                 GpuVramMonitor.ClosePdhIfIdle();
                 SystemSnapshot postSnap = BuildSnapshotCore(sweptDisk, false);
@@ -899,27 +1275,55 @@ namespace Legram
 
         private static bool TrimSingleProcessSafe(int pid, bool lowerMemPriorityFirst)
         {
+            return TrimSingleProcessSafe(pid, lowerMemPriorityFirst, false);
+        }
+
+        public static bool TrimSingleProcessSafe(int pid, bool lowerMemPriorityFirst, bool keepLowMemPrio)
+        {
             uint access = NativeApi.PROCESS_QUERY_LIMITED_INFORMATION | NativeApi.PROCESS_SET_QUOTA;
             if (lowerMemPriorityFirst) access |= NativeApi.PROCESS_SET_INFORMATION;
 
             IntPtr h = NativeApi.OpenProcess(access, false, pid);
+            bool hasSetInfo = lowerMemPriorityFirst;
             if (h == IntPtr.Zero && lowerMemPriorityFirst)
             {
+                hasSetInfo = false;
                 h = NativeApi.OpenProcess(NativeApi.PROCESS_QUERY_LIMITED_INFORMATION | NativeApi.PROCESS_SET_QUOTA, false, pid);
             }
             if (h == IntPtr.Zero) return false;
 
+            bool loweredMemPrio = false;
+            uint originalMemPrio = NativeApi.MEMORY_PRIORITY_NORMAL;
             try
             {
-                if (lowerMemPriorityFirst)
+                if (hasSetInfo)
                 {
+                    if (!keepLowMemPrio)
+                    {
+                        NativeApi.MEMORY_PRIORITY_INFORMATION origMpi;
+                        if (NativeApi.GetProcessInformation(
+                            h, NativeApi.ProcessMemoryPriority,
+                            out origMpi, (uint)Marshal.SizeOf(typeof(NativeApi.MEMORY_PRIORITY_INFORMATION)))
+                            && origMpi.MemoryPriority > NativeApi.MEMORY_PRIORITY_LOW)
+                        {
+                            originalMemPrio = origMpi.MemoryPriority;
+                        }
+                        else
+                        {
+                            originalMemPrio = NativeApi.MEMORY_PRIORITY_NORMAL;
+                        }
+                    }
+
                     NativeApi.MEMORY_PRIORITY_INFORMATION mpi = new NativeApi.MEMORY_PRIORITY_INFORMATION
                     {
                         MemoryPriority = NativeApi.MEMORY_PRIORITY_LOW
                     };
-                    NativeApi.SetProcessInformation(
+                    if (NativeApi.SetProcessInformation(
                         h, NativeApi.ProcessMemoryPriority,
-                        ref mpi, (uint)Marshal.SizeOf(typeof(NativeApi.MEMORY_PRIORITY_INFORMATION)));
+                        ref mpi, (uint)Marshal.SizeOf(typeof(NativeApi.MEMORY_PRIORITY_INFORMATION))))
+                    {
+                        loweredMemPrio = true;
+                    }
                 }
                 return NativeApi.K32EmptyWorkingSet(h);
             }
@@ -929,6 +1333,20 @@ namespace Legram
             }
             finally
             {
+                if (loweredMemPrio && !keepLowMemPrio)
+                {
+                    try
+                    {
+                        NativeApi.MEMORY_PRIORITY_INFORMATION restoreMpi = new NativeApi.MEMORY_PRIORITY_INFORMATION
+                        {
+                            MemoryPriority = originalMemPrio
+                        };
+                        NativeApi.SetProcessInformation(
+                            h, NativeApi.ProcessMemoryPriority,
+                            ref restoreMpi, (uint)Marshal.SizeOf(typeof(NativeApi.MEMORY_PRIORITY_INFORMATION)));
+                    }
+                    catch { }
+                }
                 NativeApi.CloseHandle(h);
             }
         }
@@ -955,34 +1373,93 @@ namespace Legram
             }
         }
 
-        private static bool TryShutdownIdleWsl()
+        private static long MeasureWslWorkingSetBytes()
         {
+            long total = 0L;
             try
             {
                 Process[] vms = Process.GetProcessesByName("vmmemWSL");
                 if (vms.Length == 0) vms = Process.GetProcessesByName("vmmem");
-                for (int i = 0; i < vms.Length; i++) vms[i].Dispose();
-                if (vms.Length == 0) return false;
-
-                Process[] activeBash = Process.GetProcessesByName("bash");
-                for (int i = 0; i < activeBash.Length; i++) activeBash[i].Dispose();
-                if (activeBash.Length > 0) return false;
-
-                ProcessStartInfo psi = new ProcessStartInfo("wsl.exe", "--shutdown")
+                for (int i = 0; i < vms.Length; i++)
                 {
-                    CreateNoWindow = true,
-                    UseShellExecute = false,
-                    WindowStyle = ProcessWindowStyle.Hidden
-                };
-                using (Process p = Process.Start(psi))
-                {
-                    if (p != null) p.WaitForExit(3500);
+                    using (Process vm = vms[i])
+                    {
+                        try { total += vm.WorkingSet64; } catch { }
+                    }
                 }
-                return true;
+            }
+            catch { }
+            return total;
+        }
+
+        private static long ReclaimWslMemorySafe(bool allowIdleShutdown)
+        {
+            try
+            {
+                long wsBefore = MeasureWslWorkingSetBytes();
+                if (wsBefore <= 96L * 1048576L) return 0L;
+
+                // 1. Non-destructive Linux page-cache drop (preserves active terminals & Docker containers!)
+                try
+                {
+                    ProcessStartInfo psiDrop = new ProcessStartInfo(
+                        "wsl.exe",
+                        "-u root -e sh -c \"sync; echo 3 > /proc/sys/vm/drop_caches\"")
+                    {
+                        CreateNoWindow = true,
+                        UseShellExecute = false,
+                        WindowStyle = ProcessWindowStyle.Hidden
+                    };
+                    using (Process p = Process.Start(psiDrop))
+                    {
+                        if (p != null) p.WaitForExit(2200);
+                    }
+                }
+                catch { }
+
+                // 2. Only shut down idle WSL VM if explicitly allowed AND zero active WSL/Docker clients exist
+                if (allowIdleShutdown)
+                {
+                    bool hasActiveClient = false;
+                    string[] wslGuardNames = new string[] { "bash", "wsl", "wslhost", "ubuntu", "debian", "docker", "com.docker.backend", "podman" };
+                    for (int k = 0; k < wslGuardNames.Length; k++)
+                    {
+                        Process[] active = Process.GetProcessesByName(wslGuardNames[k]);
+                        int len = active.Length;
+                        for (int i = 0; i < len; i++) active[i].Dispose();
+                        if (len > 0)
+                        {
+                            hasActiveClient = true;
+                            break;
+                        }
+                    }
+
+                    if (!hasActiveClient)
+                    {
+                        try
+                        {
+                            ProcessStartInfo psiShut = new ProcessStartInfo("wsl.exe", "--shutdown")
+                            {
+                                CreateNoWindow = true,
+                                UseShellExecute = false,
+                                WindowStyle = ProcessWindowStyle.Hidden
+                            };
+                            using (Process p = Process.Start(psiShut))
+                            {
+                                if (p != null) p.WaitForExit(3000);
+                            }
+                        }
+                        catch { }
+                    }
+                }
+
+                Thread.Sleep(80);
+                long wsAfter = MeasureWslWorkingSetBytes();
+                return Math.Max(0L, wsBefore - wsAfter);
             }
             catch
             {
-                return false;
+                return 0L;
             }
         }
 
@@ -991,6 +1468,51 @@ namespace Legram
             NativeApi.MEMORYSTATUSEX ms = new NativeApi.MEMORYSTATUSEX();
             if (NativeApi.GlobalMemoryStatusEx(ms)) return (long)ms.ullAvailPhys;
             return 0;
+        }
+
+        private static long ReadFreeZeroRamBytes()
+        {
+            long freeZero, standbyTotal;
+            ReadFreeZeroAndStandbyBytes(out freeZero, out standbyTotal);
+            return freeZero;
+        }
+
+        private static void ReadFreeZeroAndStandbyBytes(out long freeZeroBytes, out long standbyTotalBytes)
+        {
+            freeZeroBytes = 0L;
+            standbyTotalBytes = 0L;
+            int mliSize = Marshal.SizeOf(typeof(NativeApi.SYSTEM_MEMORY_LIST_INFORMATION));
+            IntPtr mliBuf = Marshal.AllocHGlobal(mliSize);
+            try
+            {
+                int retLen;
+                if (NativeApi.NtQuerySystemInformation(NativeApi.SystemMemoryListInformation, mliBuf, mliSize, out retLen) == 0)
+                {
+                    NativeApi.SYSTEM_MEMORY_LIST_INFORMATION mli =
+                        (NativeApi.SYSTEM_MEMORY_LIST_INFORMATION)Marshal.PtrToStructure(mliBuf, typeof(NativeApi.SYSTEM_MEMORY_LIST_INFORMATION));
+                    freeZeroBytes = (long)(((ulong)mli.FreePageCount + (ulong)mli.ZeroPageCount) * 4096UL);
+                    ulong totalSt = 0;
+                    for (int p = 0; p < 8; p++)
+                    {
+                        totalSt += (ulong)mli.PageCountByPriority[p] * 4096UL;
+                    }
+                    standbyTotalBytes = (long)totalSt;
+                }
+            }
+            catch { }
+            finally
+            {
+                Marshal.FreeHGlobal(mliBuf);
+            }
+        }
+
+        private static bool IsCurrentIslcStandbySaturated()
+        {
+            long freeZero, standbyTotal;
+            ReadFreeZeroAndStandbyBytes(out freeZero, out standbyTotal);
+            return standbyTotal >= 4096L * 1048576L
+                && freeZero > 0
+                && freeZero < 1024L * 1048576L;
         }
 
         public bool IsKernelPurgeTaskRegistered()
@@ -1081,6 +1603,14 @@ namespace Legram
         // Invoked both opportunistically (if process holds privileges) and inside `--purge-helper` elevated execution!
         public static bool TryDirectKernelCombineAndStandbyPurge()
         {
+            long combinedBytes;
+            bool allowFullEmergency = IsCurrentIslcStandbySaturated();
+            return TryDirectKernelCombineAndStandbyPurge(allowFullEmergency, true, out combinedBytes);
+        }
+
+        public static bool TryDirectKernelCombineAndStandbyPurge(bool allowFullStandbyEmergency, bool runCombine, out long combinedBytes)
+        {
+            combinedBytes = 0L;
             try
             {
                 bool regOk, sysCacheOk;
@@ -1102,20 +1632,39 @@ namespace Legram
                 catch { }
 
                 // 1. MemoryCombineInformationEx (InfoClass = 130) - safe page deduplication
-                NativeApi.MEMORY_COMBINE_INFORMATION_EX combine = new NativeApi.MEMORY_COMBINE_INFORMATION_EX();
-                int stCombine = NativeApi.NtSetSystemInformation(
-                    NativeApi.SystemCombinePhysicalMemoryInformation,
-                    ref combine,
-                    Marshal.SizeOf(typeof(NativeApi.MEMORY_COMBINE_INFORMATION_EX)));
+                int stCombine = -1;
+                if (runCombine)
+                {
+                    NativeApi.MEMORY_COMBINE_INFORMATION_EX combine = new NativeApi.MEMORY_COMBINE_INFORMATION_EX();
+                    stCombine = NativeApi.NtSetSystemInformation(
+                        NativeApi.SystemCombinePhysicalMemoryInformation,
+                        ref combine,
+                        Marshal.SizeOf(typeof(NativeApi.MEMORY_COMBINE_INFORMATION_EX)));
+                    if (stCombine == 0)
+                    {
+                        combinedBytes = (long)((ulong)combine.PagesCombined * 4096UL);
+                    }
+                }
 
-                // 2. MemoryPurgeLowPriorityStandbyList (Command = 5 on InfoClass = 80) - 0 stutter!
-                int cmd = NativeApi.MemoryPurgeLowPriorityStandbyList;
+                // 2. MemoryPurgeLowPriorityStandbyList (Command = 5 on InfoClass = 80) - Priority 0, 0 stutter!
+                int cmdLow = NativeApi.MemoryPurgeLowPriorityStandbyList;
                 int stStandby = NativeApi.NtSetSystemInformation(
                     NativeApi.SystemMemoryListInformation,
-                    ref cmd,
+                    ref cmdLow,
                     sizeof(int));
 
-                return stStandby == 0 || stCombine == 0 || sysCacheOk;
+                // 3. Emergency full Standby purge (Command = 4) ONLY when ISLC saturation is active (Standby >= 4 GB & Free+Zero < 1 GB)
+                int stEmergency = -1;
+                if (allowFullStandbyEmergency)
+                {
+                    int cmdFull = NativeApi.MemoryPurgeStandbyList;
+                    stEmergency = NativeApi.NtSetSystemInformation(
+                        NativeApi.SystemMemoryListInformation,
+                        ref cmdFull,
+                        sizeof(int));
+                }
+
+                return stStandby == 0 || stEmergency == 0 || stCombine == 0 || sysCacheOk;
             }
             catch
             {

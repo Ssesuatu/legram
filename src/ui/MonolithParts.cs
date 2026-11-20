@@ -459,6 +459,7 @@ namespace Legram
     }
 
     // Authentic App Logo + Bespoke Vector Fallback Process Row (Inspirations #3, #4 & #8)
+    // Click or Right-Click any process row to toggle 1-Click Immunity (Shield) or gently trim its working set.
     public sealed class EditorialLedgerRow : Border
     {
         private readonly Border appBadge;
@@ -471,11 +472,19 @@ namespace Legram
         private readonly TextBlock memText;
         private readonly TextBlock rowTip;
 
+        private ProcessGroupItem boundItem;
+        private bool isHover;
+
+        public ProcessGroupItem BoundItem { get { return boundItem; } }
+        public event Action<ProcessGroupItem> RowClicked;
+
         public EditorialLedgerRow()
         {
             Height = 31;
-            Padding = new Thickness(2, 0, 2, 0);
+            CornerRadius = new CornerRadius(8);
+            Padding = new Thickness(4, 0, 4, 0);
             Background = Brushes.Transparent;
+            Cursor = Cursors.Hand;
 
             Grid g = new Grid();
             g.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
@@ -549,16 +558,51 @@ namespace Legram
             rowTip.TextWrapping = TextWrapping.Wrap;
             rowTip.MaxWidth = 290;
             ToolTip = Chrome.Tip(rowTip);
+
+            MouseEnter += delegate
+            {
+                isHover = true;
+                Background = Theme.BrushHex(0x14FFFFFFu);
+            };
+            MouseLeave += delegate
+            {
+                isHover = false;
+                Background = Brushes.Transparent;
+            };
+            MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e)
+            {
+                e.Handled = true;
+            };
+            MouseLeftButtonUp += delegate(object s, MouseButtonEventArgs e)
+            {
+                e.Handled = true;
+                if (boundItem != null)
+                {
+                    Action<ProcessGroupItem> h = RowClicked;
+                    if (h != null) h(boundItem);
+                }
+            };
+            MouseRightButtonUp += delegate(object s, MouseButtonEventArgs e)
+            {
+                e.Handled = true;
+                if (boundItem != null)
+                {
+                    Action<ProcessGroupItem> h = RowClicked;
+                    if (h != null) h(boundItem);
+                }
+            };
         }
 
         public void Bind(ProcessGroupItem item, HausPalette pal)
         {
+            boundItem = item;
             if (item == null)
             {
                 Visibility = Visibility.Collapsed;
                 return;
             }
             Visibility = Visibility.Visible;
+            Background = isHover ? Theme.BrushHex(0x14FFFFFFu) : Brushes.Transparent;
 
             Theme.Set(nameText, item.DisplayName);
             Theme.Set(countText, item.ProcessCount > 1 ? ("\u00B7 " + item.ProcessCount) : "");
@@ -566,7 +610,7 @@ namespace Legram
             Theme.Set(memText, Fmt.Gb2(item.WorkingSetBytes));
 
             appBadge.Background = pal.IconWellFill;
-            appBadge.BorderBrush = pal.TileBorder;
+            appBadge.BorderBrush = item.IsUserWhitelisted ? pal.Mint : pal.TileBorder;
 
             ImageSource realIcon = AppIconCache.TryGet(item);
             if (realIcon != null)
@@ -583,7 +627,16 @@ namespace Legram
                 fallbackVecIcon.Data = Theme.FallbackGeometryForGroup(item.IconKind);
             }
 
-            if (item.IsProtected)
+            if (item.IsUserWhitelisted)
+            {
+                fallbackVecIcon.Stroke = pal.Mint;
+                statePill.Background = pal.MintBg;
+                Theme.Set(stateText, "Immune");
+                Theme.Set(stateText, pal.Mint);
+                Theme.Set(nameText, pal.InkPrimary);
+                Theme.Set(memText, pal.Mint);
+            }
+            else if (item.IsProtected)
             {
                 fallbackVecIcon.Stroke = pal.Mint;
                 statePill.Background = pal.MintBg;
@@ -601,11 +654,23 @@ namespace Legram
                 Theme.Set(nameText, pal.InkPrimary);
                 Theme.Set(memText, pal.Amber);
             }
+            else if (item.IsOnInactiveDesktop && item.PrimaryDesktopNumber > 0)
+            {
+                fallbackVecIcon.Stroke = pal.Ice;
+                statePill.Background = pal.IceBg;
+                Theme.Set(stateText, "D" + item.PrimaryDesktopNumber + " Sleep");
+                Theme.Set(stateText, pal.Ice);
+                Theme.Set(nameText, pal.InkPrimary);
+                Theme.Set(memText, pal.InkSecondary);
+            }
             else if (item.IsEcoQosActive)
             {
                 fallbackVecIcon.Stroke = pal.Ice;
                 statePill.Background = pal.IceBg;
-                Theme.Set(stateText, "EcoQoS");
+                string ecoLbl = item.PrimaryDesktopNumber > 0
+                    ? ("D" + item.PrimaryDesktopNumber + "\u00B7Eco")
+                    : "EcoQoS";
+                Theme.Set(stateText, ecoLbl);
                 Theme.Set(stateText, pal.Ice);
                 Theme.Set(nameText, pal.InkPrimary);
                 Theme.Set(memText, pal.InkPrimary);
@@ -614,7 +679,10 @@ namespace Legram
             {
                 fallbackVecIcon.Stroke = pal.InkSecondary;
                 statePill.Background = pal.PillBadgeFill;
-                Theme.Set(stateText, item.IsForeground ? "Focus" : "Bg");
+                string bgLbl = item.IsForeground
+                    ? "Focus"
+                    : (item.PrimaryDesktopNumber > 0 ? ("Desk " + item.PrimaryDesktopNumber) : "Bg");
+                Theme.Set(stateText, bgLbl);
                 Theme.Set(stateText, item.IsForeground ? pal.InkPrimary : pal.InkMuted);
                 Theme.Set(nameText, pal.InkPrimary);
                 Theme.Set(memText, pal.InkPrimary);
@@ -623,14 +691,20 @@ namespace Legram
             string vramLine = item.DedicatedVramBytes >= 8L * 1048576L
                 ? ("\nDedicated VRAM: " + Fmt.BytesShort(item.DedicatedVramBytes))
                 : "";
+            string actionHint = item.IsProtected
+                ? "System/Active Shield (Immune automatically)"
+                : (item.IsUserWhitelisted
+                    ? "Click row: Remove 1-Click Immune Shield"
+                    : "Click row: Toggle 1-Click Immune Shield or Trim Memory");
             Theme.Set(rowTip, string.Format(CultureInfo.InvariantCulture,
-                "{0} ({1} {2})\nRAM Working Set: {3}{4}\nStatus: {5}",
+                "{0} ({1} {2})\nRAM Working Set: {3}{4}\nStatus: {5}\n\u2022 {6}",
                 item.DisplayName,
                 item.ProcessCount,
                 item.ProcessCount == 1 ? "process" : "processes",
                 Fmt.Gb2(item.WorkingSetBytes),
                 vramLine,
-                string.IsNullOrEmpty(item.Subtitle) ? "Auto-managed" : item.Subtitle));
+                string.IsNullOrEmpty(item.Subtitle) ? "Auto-managed" : item.Subtitle,
+                actionHint));
         }
     }
 
@@ -1047,6 +1121,9 @@ namespace Legram
         private MemoryPressure currentPressure = MemoryPressure.Healthy;
         private long cachedGainBytes = 1200L * 1048576L;
         private string cachedCelebration = "";
+        private string sessionLastSummary = "";
+        private int sessionRunCount;
+        private long sessionTotalFreedBytes;
         private bool isWorkingExternal;
         private bool isSweepAnimating;
         private bool isHover;
@@ -1121,7 +1198,9 @@ namespace Legram
             contentGrid.Children.Add(rightChipBorder);
             Children.Add(contentGrid);
 
-            tipBody = Theme.Text("1-Click Harmonize RAM, GPU VRAM & Physical SSD Junk", 11, FontWeights.Normal, Theme.Obsidian.InkPrimary);
+            tipBody = Theme.Text("1-Click Harmonize RAM, GPU VRAM, WSL2 & Physical SSD Junk (Shortcut: Ctrl+Alt+H)", 11, FontWeights.Normal, Theme.Obsidian.InkPrimary);
+            tipBody.TextWrapping = TextWrapping.Wrap;
+            tipBody.MaxWidth = 320;
             ToolTip = Chrome.Tip(tipBody);
 
             MouseEnter += delegate
@@ -1241,6 +1320,13 @@ namespace Legram
             SyncVisuals();
         }
 
+        public void SetSessionTelemetry(string lastSummary, int sessionCount, long sessionFreedBytes)
+        {
+            sessionLastSummary = lastSummary ?? "";
+            sessionRunCount = Math.Max(0, sessionCount);
+            sessionTotalFreedBytes = Math.Max(0L, sessionFreedBytes);
+        }
+
         public void Apply(HausPalette pal, MemoryPressure pressure, long estimatedGainBytes, bool working, string celebrationText)
         {
             palette = pal ?? Theme.Obsidian;
@@ -1315,7 +1401,19 @@ namespace Legram
 
             arrowIcon.Stroke = Theme.BrushHex(0xFFE2E8F0u);
             arrowIcon.Visibility = Visibility.Visible;
-            Theme.Set(tipBody, "1-Click Harmonize RAM, GPU VRAM & Physical SSD Junk");
+            string idleTip = "1-Click Harmonize RAM, GPU VRAM, WSL2 & Physical SSD Junk (Shortcut: Ctrl+Alt+H)";
+            if (sessionRunCount > 0 || !string.IsNullOrEmpty(sessionLastSummary))
+            {
+                if (!string.IsNullOrEmpty(sessionLastSummary))
+                {
+                    idleTip += "\n" + sessionLastSummary;
+                }
+                if (sessionRunCount > 0)
+                {
+                    idleTip += "\nSession Total (" + sessionRunCount.ToString(CultureInfo.InvariantCulture) + "x): +" + Fmt.BytesShort(sessionTotalFreedBytes);
+                }
+            }
+            Theme.Set(tipBody, idleTip);
         }
 
         private static string ExtractGainChip(string summary, long estBytes)

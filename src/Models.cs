@@ -25,7 +25,9 @@ namespace Legram
         LocalTcpListener = 1 << 6,
         ForegroundWindow = 1 << 7,
         ActiveAudioStream = 1 << 8,
-        CreativeRender = 1 << 9
+        CreativeRender = 1 << 9,
+        UserWhitelisted = 1 << 10,
+        GameFullscreen = 1 << 11
     }
 
     public enum GroupIconKind
@@ -52,10 +54,19 @@ namespace Legram
         public int EncoderUtilPercent;
         public double PowerWatts;
         public long ReclaimableVramBytes;
+        public long SharedGpuUsedBytes;
+        public long VramCompositorBytes;
+        public long VramBrowserBytes;
+        public long VramAiBytes;
+        public long VramAppsAndGamesBytes;
         public List<int> RefreshableBrowserGpuPids = new List<int>();
         public int IdleOllamaModelCount;
         public long IdleOllamaVramBytes;
         public string IdleOllamaSummary = "";
+        public int IdleAiEngineCount;
+        public long IdleAiVramBytes;
+        public string IdleAiSummary = "";
+        public string CategoryBreakdownSummary = "";
         public string TopVramSummary = "";
 
         public double VramUsedPercent
@@ -119,10 +130,13 @@ namespace Legram
         public long DedicatedVramBytes;
         public long EstimTrimmableBytes;
         public bool IsProtected;
+        public bool IsUserWhitelisted;
         public ProtectionReason Reason;
         public bool IsEcoQosActive;
         public bool IsForeground;
         public bool IsOrphanGroup;
+        public int PrimaryDesktopNumber;
+        public bool IsOnInactiveDesktop;
         public List<int> Pids = new List<int>();
     }
 
@@ -131,6 +145,8 @@ namespace Legram
         public long RecycleBinBytes;
         public long LocalTempBytes;
         public long CrashDumpBytes;
+        public long WerArchiveBytes;
+        public long StaleShaderAndUpdaterBytes;
         public long PhotoshopScratchBytes;
         public bool PhotoshopRunning;
 
@@ -138,7 +154,12 @@ namespace Legram
         {
             get
             {
-                return RecycleBinBytes + LocalTempBytes + CrashDumpBytes + (PhotoshopRunning ? 0 : PhotoshopScratchBytes);
+                return RecycleBinBytes
+                    + LocalTempBytes
+                    + CrashDumpBytes
+                    + WerArchiveBytes
+                    + StaleShaderAndUpdaterBytes
+                    + (PhotoshopRunning ? 0 : PhotoshopScratchBytes);
             }
         }
     }
@@ -162,6 +183,14 @@ namespace Legram
         public int UsedRamPercent;
         public MemoryPressure Pressure;
         public bool RenderShieldActive;
+        public bool GameShieldActive;
+        public string ActiveGameName = "";
+        public int UserImmuneGroupCount;
+        public int ActiveDesktopNumber = 1;
+        public int TotalDesktopCount = 1;
+        public string ActiveDesktopName = "Desktop 1";
+        public int SleepingDesktopAppCount;
+        public string VirtualDesktopTooltipSummary = "Active: Desktop 1";
         public bool KernelPurgeTaskReady;
         public int ProtectedProcessCount;
         public int TcpListenerCount;
@@ -173,6 +202,9 @@ namespace Legram
         public long DwmWorkingSetBytes;
         public long DwmVramBytes;
         public string GuardTooltipSummary = "";
+        public string LastHarmonizeSummary = "";
+        public long SessionTotalFreedBytes;
+        public int SessionHarmonizeCount;
         public GpuSnapshot Gpu = new GpuSnapshot();
         public List<DriveSnapshot> Drives = new List<DriveSnapshot>();
         public DriveSnapshot PrimaryDisplayDrive;
@@ -283,20 +315,34 @@ namespace Legram
             }
         }
 
-        // Honest, un-inflated reclaimable estimate (zero artificial floor!)
+        // Honest Available-RAM gain estimate (ullAvailPhys already includes Standby, so Standby is tracked separately!)
         public long EstimatedPurgeGainBytes
         {
             get
             {
-                long standbyEst = KernelPurgeTaskReady ? (long)(StandbyLowPrioBytes * 0.72) : (long)(StandbyP0Bytes * 0.50);
                 long dwmEst = IsDwmBloated ? Math.Max(0L, DwmWorkingSetBytes - 220L * 1048576L) : 0L;
-                return Math.Max(0L, WorkingSetTrimmableBytes + standbyEst + dwmEst);
+                return Math.Max(0L, WorkingSetTrimmableBytes + dwmEst);
+            }
+        }
+
+        // Cold Standby pages ready to be zeroed into true Free RAM via 0-UAC Kernel Helper
+        public long EstimatedStandbyZeroBytes
+        {
+            get
+            {
+                if (!KernelPurgeTaskReady) return 0L;
+                if (IsIslcStandbySaturated) return StandbyTotalBytes;
+                return StandbyP0Bytes;
             }
         }
 
         public long EstimatedVramAndAiGainBytes
         {
-            get { return Math.Max(0L, Gpu.ReclaimableVramBytes + Gpu.IdleOllamaVramBytes + OrphanAiBytes); }
+            get
+            {
+                long aiVram = Gpu.IdleAiVramBytes > 0 ? Gpu.IdleAiVramBytes : Gpu.IdleOllamaVramBytes;
+                return Math.Max(0L, Gpu.ReclaimableVramBytes + aiVram + OrphanAiBytes);
+            }
         }
 
         public long EstimatedHarmonyGainBytes
@@ -313,11 +359,15 @@ namespace Legram
     {
         public bool Success;
         public long FreedRamBytes;
+        public long StandbyZeroedBytes;
+        public long CombinedBytes;
+        public long WslReclaimedBytes;
         public long FreedVramBytes;
         public long FreedDiskBytes;
         public int TrimmedProcessCount;
         public int ReapedOrphanCount;
         public int UnloadedOllamaModels;
+        public int UnloadedAiTargets;
         public bool KernelStandbyPurged;
         public bool RegistryCacheFlushed;
         public bool SystemCacheTrimmed;

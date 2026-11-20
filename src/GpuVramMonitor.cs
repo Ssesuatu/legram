@@ -11,6 +11,7 @@ namespace Legram
         private static bool nvmlChecked;
         private static bool nvmlReady;
         private static IntPtr nvmlDevice = IntPtr.Zero;
+        private static DateTime nextNvmlRetryUtc = DateTime.MinValue;
         private static string cachedFullName = "Windows WDDM GPU";
         private static string cachedShortName = "GPU";
         private static readonly object Sync = new object();
@@ -18,12 +19,43 @@ namespace Legram
         // Persistent PDH query handle (opened lazily only when Popover / VRAM refresh needs per-PID breakdown)
         private static IntPtr persistentPdhQuery = IntPtr.Zero;
         private static IntPtr persistentPdhCounter = IntPtr.Zero;
+        private static IntPtr persistentPdhSharedCounter = IntPtr.Zero;
 
         private static readonly Dictionary<int, bool> KnownBrowserGpuPidCache = new Dictionary<int, bool>();
+
+        public static void NotifyDisplayOrPowerReset()
+        {
+            lock (Sync)
+            {
+                if (persistentPdhQuery != IntPtr.Zero)
+                {
+                    try { NativeApi.PdhCloseQuery(persistentPdhQuery); } catch { }
+                    persistentPdhQuery = IntPtr.Zero;
+                    persistentPdhCounter = IntPtr.Zero;
+                    persistentPdhSharedCounter = IntPtr.Zero;
+                }
+
+                if (nvmlReady)
+                {
+                    try { NativeApi.NvmlShutdown(); } catch { }
+                }
+
+                nvmlReady = false;
+                nvmlChecked = false;
+                nvmlDevice = IntPtr.Zero;
+                nextNvmlRetryUtc = DateTime.MinValue;
+
+                lock (KnownBrowserGpuPidCache)
+                {
+                    KnownBrowserGpuPidCache.Clear();
+                }
+            }
+        }
 
         private static void EnsureNvml()
         {
             if (nvmlChecked) return;
+            if (DateTime.UtcNow < nextNvmlRetryUtc) return;
             nvmlChecked = true;
             try
             {
@@ -34,6 +66,7 @@ namespace Legram
                     {
                         nvmlDevice = dev;
                         nvmlReady = true;
+                        nextNvmlRetryUtc = DateTime.MinValue;
                         StringBuilder sb = new StringBuilder(96);
                         if (NativeApi.NvmlDeviceGetName(dev, sb, (uint)sb.Capacity) == 0)
                         {
@@ -72,8 +105,24 @@ namespace Legram
 
         private static GpuSnapshot SampleCore(bool includePerPidPdh, out Dictionary<int, long> perPidDedicatedVram)
         {
-            perPidDedicatedVram = includePerPidPdh ? QueryPerPidDedicatedVramPdh() : new Dictionary<int, long>();
+            Dictionary<int, long> perPidSharedGpu;
+            if (includePerPidPdh)
+            {
+                perPidDedicatedVram = QueryPerPidGpuMemoryPdh(out perPidSharedGpu);
+            }
+            else
+            {
+                perPidDedicatedVram = new Dictionary<int, long>();
+                perPidSharedGpu = new Dictionary<int, long>();
+            }
+
             GpuSnapshot snap = new GpuSnapshot();
+            if (includePerPidPdh && perPidSharedGpu.Count > 0)
+            {
+                long sharedSum = 0;
+                foreach (long sv in perPidSharedGpu.Values) sharedSum += sv;
+                snap.SharedGpuUsedBytes = sharedSum;
+            }
 
             lock (Sync)
             {
@@ -86,6 +135,7 @@ namespace Legram
 
                     try
                     {
+                        bool memOk = false;
                         NativeApi.nvmlMemory_v2_t mem2 = new NativeApi.nvmlMemory_v2_t();
                         mem2.version = (uint)(Marshal.SizeOf(typeof(NativeApi.nvmlMemory_v2_t)) | (2 << 24));
                         if (NativeApi.NvmlDeviceGetMemoryInfoV2(nvmlDevice, ref mem2) == 0)
@@ -93,6 +143,7 @@ namespace Legram
                             snap.VramTotalBytes = (long)mem2.total;
                             snap.VramUsedBytes = (long)mem2.used;
                             snap.VramReservedBytes = (long)mem2.reserved;
+                            memOk = true;
                         }
                         else
                         {
@@ -101,26 +152,39 @@ namespace Legram
                             {
                                 snap.VramTotalBytes = (long)mem1.total;
                                 snap.VramUsedBytes = (long)mem1.used;
+                                memOk = true;
                             }
                         }
 
-                        uint temp;
-                        if (NativeApi.NvmlDeviceGetTemperature(nvmlDevice, 0, out temp) == 0)
-                            snap.TemperatureC = (int)temp;
+                        if (!memOk)
+                        {
+                            try { NativeApi.NvmlShutdown(); } catch { }
+                            nvmlReady = false;
+                            nvmlChecked = false;
+                            nvmlDevice = IntPtr.Zero;
+                            nextNvmlRetryUtc = DateTime.UtcNow.AddSeconds(3);
+                            snap.Available = false;
+                        }
+                        else
+                        {
+                            uint temp;
+                            if (NativeApi.NvmlDeviceGetTemperature(nvmlDevice, 0, out temp) == 0)
+                                snap.TemperatureC = (int)temp;
 
-                        NativeApi.nvmlUtilization_t util;
-                        if (NativeApi.NvmlDeviceGetUtilizationRates(nvmlDevice, out util) == 0)
-                            snap.GpuUtilPercent = (int)util.gpu;
+                            NativeApi.nvmlUtilization_t util;
+                            if (NativeApi.NvmlDeviceGetUtilizationRates(nvmlDevice, out util) == 0)
+                                snap.GpuUtilPercent = (int)util.gpu;
 
-                        uint mw;
-                        if (NativeApi.NvmlDeviceGetPowerUsage(nvmlDevice, out mw) == 0)
-                            snap.PowerWatts = mw / 1000.0;
+                            uint mw;
+                            if (NativeApi.NvmlDeviceGetPowerUsage(nvmlDevice, out mw) == 0)
+                                snap.PowerWatts = mw / 1000.0;
 
-                        uint decUtil, decPer, encUtil, encPer;
-                        if (NativeApi.NvmlDeviceGetDecoderUtilization(nvmlDevice, out decUtil, out decPer) == 0)
-                            snap.DecoderUtilPercent = (int)decUtil;
-                        if (NativeApi.NvmlDeviceGetEncoderUtilization(nvmlDevice, out encUtil, out encPer) == 0)
-                            snap.EncoderUtilPercent = (int)encUtil;
+                            uint decUtil, decPer, encUtil, encPer;
+                            if (NativeApi.NvmlDeviceGetDecoderUtilization(nvmlDevice, out decUtil, out decPer) == 0)
+                                snap.DecoderUtilPercent = (int)decUtil;
+                            if (NativeApi.NvmlDeviceGetEncoderUtilization(nvmlDevice, out encUtil, out encPer) == 0)
+                                snap.EncoderUtilPercent = (int)encUtil;
+                        }
                     }
                     catch
                     {
@@ -134,21 +198,6 @@ namespace Legram
                     ? ("NVML Direct \u00B7 Decoder " + snap.DecoderUtilPercent + "% \u00B7 Encoder " + snap.EncoderUtilPercent + "%")
                     : "WDDM GPU Active";
                 return snap;
-            }
-
-            // Probe idle Ollama VRAM models ONLY if ollama process is actually present and GPU is idle
-            if (!snap.IsRenderingOrDecoding && snap.GpuUtilPercent < 10 && IsOllamaDaemonPresent())
-            {
-                List<string> idleModels;
-                long ollamaVram;
-                ProbeOllamaLoadedModels("http://127.0.0.1:11434", out idleModels, out ollamaVram);
-                if (idleModels.Count > 0)
-                {
-                    snap.IdleOllamaModelCount = idleModels.Count;
-                    snap.IdleOllamaVramBytes = ollamaVram > 0 ? ollamaVram : (512L * 1048576L);
-                    snap.IdleOllamaSummary = "Idle Ollama: " + string.Join(", ", idleModels.ToArray())
-                        + " (" + Fmt.BytesShort(snap.IdleOllamaVramBytes) + ")";
-                }
             }
 
             if (!snap.Available && perPidDedicatedVram.Count > 0)
@@ -169,15 +218,35 @@ namespace Legram
             {
                 int pid = topVram[i].Key;
                 long bytes = topVram[i].Value;
-                if (bytes < 25L * 1024 * 1024) continue;
+                if (bytes <= 0) continue;
 
                 string pname = TryGetProcessNameFast(pid);
+                string low = (pname ?? "").ToLowerInvariant();
+
+                if (IsCompositorOrShellProcess(low))
+                {
+                    snap.VramCompositorBytes += bytes;
+                }
+                else if (IsBrowserProcess(low))
+                {
+                    snap.VramBrowserBytes += bytes;
+                }
+                else if (IsAiEngineProcess(low))
+                {
+                    snap.VramAiBytes += bytes;
+                }
+                else
+                {
+                    snap.VramAppsAndGamesBytes += bytes;
+                }
+
+                if (bytes < 25L * 1024 * 1024) continue;
+
                 if (summaryParts.Count < 4 && !string.IsNullOrEmpty(pname))
                 {
                     summaryParts.Add(pname + " " + Fmt.BytesShort(bytes));
                 }
 
-                string low = (pname ?? "").ToLowerInvariant();
                 if ((low == "ego" || low == "chrome" || low == "msedge" || low == "brave") && bytes >= 180L * 1024 * 1024)
                 {
                     if (IsBrowserGpuSubprocessZeroWmi(pid))
@@ -188,15 +257,121 @@ namespace Legram
                 }
             }
 
+            List<string> catParts = new List<string>();
+            if (snap.VramAiBytes > 0) catParts.Add("AI " + Fmt.BytesShort(snap.VramAiBytes));
+            if (snap.VramAppsAndGamesBytes > 0) catParts.Add("Apps/3D " + Fmt.BytesShort(snap.VramAppsAndGamesBytes));
+            if (snap.VramBrowserBytes > 0) catParts.Add("Browser " + Fmt.BytesShort(snap.VramBrowserBytes));
+            if (snap.VramCompositorBytes > 0) catParts.Add("DWM/Shell " + Fmt.BytesShort(snap.VramCompositorBytes));
+            if (snap.SharedGpuUsedBytes > 0) catParts.Add("Shared RAM " + Fmt.BytesShort(snap.SharedGpuUsedBytes));
+            snap.CategoryBreakdownSummary = catParts.Count > 0
+                ? ("Categories: " + string.Join(" \u00B7 ", catParts.ToArray()))
+                : "";
+
+            // Probe idle Local AI VRAM models (Ollama :11434, LM Studio :1234, ComfyUI :8188) ONLY when GPU is idle
+            if (!snap.IsRenderingOrDecoding && snap.GpuUtilPercent < 10)
+            {
+                List<string> aiNames = new List<string>();
+                int aiTargetCount = 0;
+                long aiVramSum = 0;
+
+                if (NativeApi.IsLoopbackTcpPortListening(11434) || IsOllamaDaemonPresent())
+                {
+                    List<string> idleModels;
+                    long ollamaVram;
+                    ProbeOllamaLoadedModels("http://127.0.0.1:11434", out idleModels, out ollamaVram);
+                    if (idleModels.Count > 0)
+                    {
+                        snap.IdleOllamaModelCount = idleModels.Count;
+                        snap.IdleOllamaVramBytes = ollamaVram > 0 ? ollamaVram : (512L * 1048576L);
+                        snap.IdleOllamaSummary = "Idle Ollama: " + string.Join(", ", idleModels.ToArray())
+                            + " (" + Fmt.BytesShort(snap.IdleOllamaVramBytes) + ")";
+                        for (int i = 0; i < idleModels.Count; i++)
+                        {
+                            aiNames.Add(idleModels[i]);
+                        }
+                        aiTargetCount += idleModels.Count;
+                        aiVramSum += snap.IdleOllamaVramBytes;
+                    }
+                }
+
+                if (IsLmStudioActive())
+                {
+                    List<string> lmsModels;
+                    ProbeLmStudioLoadedModels("http://127.0.0.1:1234", out lmsModels);
+                    if (lmsModels.Count > 0)
+                    {
+                        aiNames.Add("LM Studio (" + string.Join(", ", lmsModels.ToArray()) + ")");
+                        aiTargetCount += lmsModels.Count;
+                        if (snap.VramAiBytes > aiVramSum)
+                            aiVramSum = snap.VramAiBytes;
+                        else
+                            aiVramSum += 512L * 1048576L * lmsModels.Count;
+                    }
+                }
+
+                if (IsComfyUiActive() && snap.VramAiBytes >= 384L * 1048576L && ProbeComfyUiIdle("http://127.0.0.1:8188"))
+                {
+                    aiNames.Add("ComfyUI");
+                    aiTargetCount += 1;
+                    if (snap.VramAiBytes > aiVramSum)
+                        aiVramSum = snap.VramAiBytes;
+                    else
+                        aiVramSum += 512L * 1048576L;
+                }
+
+                if (aiTargetCount > 0)
+                {
+                    if (snap.VramAiBytes > aiVramSum) aiVramSum = snap.VramAiBytes;
+                    snap.IdleAiEngineCount = aiTargetCount;
+                    snap.IdleAiVramBytes = aiVramSum > 0 ? aiVramSum : (512L * 1048576L);
+                    snap.IdleAiSummary = "Idle AI: " + string.Join(", ", aiNames.ToArray())
+                        + " (" + Fmt.BytesShort(snap.IdleAiVramBytes) + ")";
+                }
+            }
+
             snap.TopVramSummary = summaryParts.Count > 0
                 ? "Top VRAM: " + string.Join(" \u00B7 ", summaryParts.ToArray())
                 : "VRAM healthy";
-            if (!string.IsNullOrEmpty(snap.IdleOllamaSummary))
+
+            string idleLine = !string.IsNullOrEmpty(snap.IdleAiSummary) ? snap.IdleAiSummary : snap.IdleOllamaSummary;
+            if (!string.IsNullOrEmpty(idleLine))
             {
-                snap.TopVramSummary += "\n" + snap.IdleOllamaSummary;
+                snap.TopVramSummary += "\n" + idleLine;
             }
 
             return snap;
+        }
+
+        private static bool IsCompositorOrShellProcess(string low)
+        {
+            return low == "dwm"
+                || low == "csrss"
+                || low == "explorer"
+                || low == "shellexperiencehost"
+                || low == "searchhost"
+                || low == "startmenuexperiencehost"
+                || low == "applicationframehost";
+        }
+
+        private static bool IsBrowserProcess(string low)
+        {
+            return low == "ego"
+                || low == "chrome"
+                || low == "msedge"
+                || low == "brave"
+                || low == "firefox"
+                || low == "msedgewebview2";
+        }
+
+        private static bool IsAiEngineProcess(string low)
+        {
+            return low == "ollama"
+                || low == "ollama_llama_server"
+                || low == "lm studio"
+                || low == "lms"
+                || low == "llama-server"
+                || low == "python"
+                || low == "pythonw";
         }
 
         public static bool IsOllamaDaemonPresent()
@@ -309,9 +484,226 @@ namespace Legram
             return unloaded;
         }
 
+        public static bool IsLmStudioActive()
+        {
+            return NativeApi.IsLoopbackTcpPortListening(1234);
+        }
+
+        public static void ProbeLmStudioLoadedModels(string baseUrl, out List<string> instanceIds)
+        {
+            instanceIds = new List<string>();
+            if (string.IsNullOrEmpty(baseUrl)) return;
+            try
+            {
+                System.Net.HttpWebRequest req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(baseUrl.TrimEnd('/') + "/api/v1/models");
+                req.Method = "GET";
+                req.Timeout = 400;
+                req.ReadWriteTimeout = 400;
+                req.Proxy = null;
+                using (System.Net.HttpWebResponse resp = (System.Net.HttpWebResponse)req.GetResponse())
+                using (System.IO.Stream st = resp.GetResponseStream())
+                {
+                    if (st == null) return;
+                    using (System.IO.StreamReader sr = new System.IO.StreamReader(st, Encoding.UTF8))
+                    {
+                        string json = sr.ReadToEnd();
+                        // 1. Parse "loaded_instances": [ { "id": "..." } / { "instance_id": "..." } ]
+                        System.Text.RegularExpressions.MatchCollection instArrays =
+                            System.Text.RegularExpressions.Regex.Matches(
+                                json,
+                                "\"loaded_instances\"\\s*:\\s*\\[([^\\]]*)\\]",
+                                System.Text.RegularExpressions.RegexOptions.Singleline);
+                        for (int i = 0; i < instArrays.Count; i++)
+                        {
+                            string block = instArrays[i].Groups[1].Value;
+                            System.Text.RegularExpressions.MatchCollection ids =
+                                System.Text.RegularExpressions.Regex.Matches(block, "\"(?:instance_id|id)\"\\s*:\\s*\"([^\"]+)\"");
+                            for (int k = 0; k < ids.Count; k++)
+                            {
+                                string val = ids[k].Groups[1].Value.Trim();
+                                if (!string.IsNullOrEmpty(val) && !instanceIds.Contains(val))
+                                {
+                                    instanceIds.Add(val);
+                                }
+                            }
+                        }
+
+                        // 2. Parse objects where "id"/"instance_id" precedes "state":"loaded"
+                        System.Text.RegularExpressions.MatchCollection forwardLoaded =
+                            System.Text.RegularExpressions.Regex.Matches(
+                                json,
+                                "\"(?:instance_id|id)\"\\s*:\\s*\"([^\"]+)\"(?:(?!\"(?:instance_id|id)\"\\s*:).)*?\"state\"\\s*:\\s*\"loaded\"",
+                                System.Text.RegularExpressions.RegexOptions.Singleline);
+                        for (int i = 0; i < forwardLoaded.Count; i++)
+                        {
+                            string val = forwardLoaded[i].Groups[1].Value.Trim();
+                            if (!string.IsNullOrEmpty(val) && !instanceIds.Contains(val))
+                            {
+                                instanceIds.Add(val);
+                            }
+                        }
+
+                        // 3. Parse objects where "state":"loaded" precedes "id"/"instance_id"
+                        System.Text.RegularExpressions.MatchCollection reverseLoaded =
+                            System.Text.RegularExpressions.Regex.Matches(
+                                json,
+                                "\"state\"\\s*:\\s*\"loaded\"[^{}]*?\"(?:instance_id|id)\"\\s*:\\s*\"([^\"]+)\"",
+                                System.Text.RegularExpressions.RegexOptions.Singleline);
+                        for (int i = 0; i < reverseLoaded.Count; i++)
+                        {
+                            string val = reverseLoaded[i].Groups[1].Value.Trim();
+                            if (!string.IsNullOrEmpty(val) && !instanceIds.Contains(val))
+                            {
+                                instanceIds.Add(val);
+                            }
+                        }
+                    }
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        public static int EvictLmStudioModelsAtEndpoint(string baseUrl)
+        {
+            List<string> ids;
+            ProbeLmStudioLoadedModels(baseUrl, out ids);
+            if (ids.Count == 0) return 0;
+
+            int unloaded = 0;
+            for (int i = 0; i < ids.Count; i++)
+            {
+                try
+                {
+                    string safeId = ids[i].Replace("\\", "\\\\").Replace("\"", "\\\"");
+                    byte[] payload = Encoding.UTF8.GetBytes("{\"instance_id\":\"" + safeId + "\"}");
+                    System.Net.HttpWebRequest req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(baseUrl.TrimEnd('/') + "/api/v1/models/unload");
+                    req.Method = "POST";
+                    req.ContentType = "application/json";
+                    req.ContentLength = payload.Length;
+                    req.Timeout = 1100;
+                    req.ReadWriteTimeout = 1100;
+                    req.Proxy = null;
+                    req.ServicePoint.Expect100Continue = false;
+                    using (System.IO.Stream reqSt = req.GetRequestStream())
+                    {
+                        reqSt.Write(payload, 0, payload.Length);
+                    }
+                    using (System.Net.HttpWebResponse resp = (System.Net.HttpWebResponse)req.GetResponse())
+                    {
+                        if ((int)resp.StatusCode >= 200 && (int)resp.StatusCode < 300) unloaded++;
+                    }
+                }
+                catch
+                {
+                }
+            }
+            return unloaded;
+        }
+
+        public static bool IsComfyUiActive()
+        {
+            return NativeApi.IsLoopbackTcpPortListening(8188);
+        }
+
+        public static bool ProbeComfyUiIdle(string baseUrl)
+        {
+            if (string.IsNullOrEmpty(baseUrl)) return false;
+            try
+            {
+                System.Net.HttpWebRequest req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(baseUrl.TrimEnd('/') + "/queue");
+                req.Method = "GET";
+                req.Timeout = 350;
+                req.ReadWriteTimeout = 350;
+                req.Proxy = null;
+                using (System.Net.HttpWebResponse resp = (System.Net.HttpWebResponse)req.GetResponse())
+                {
+                    if ((int)resp.StatusCode < 200 || (int)resp.StatusCode >= 300) return false;
+                    using (System.IO.Stream st = resp.GetResponseStream())
+                    {
+                        if (st == null) return false;
+                        using (System.IO.StreamReader sr = new System.IO.StreamReader(st, Encoding.UTF8))
+                        {
+                            string json = sr.ReadToEnd();
+                            bool runningEmpty = System.Text.RegularExpressions.Regex.IsMatch(json, "\"queue_running\"\\s*:\\s*\\[\\s*\\]");
+                            bool pendingEmpty = System.Text.RegularExpressions.Regex.IsMatch(json, "\"queue_pending\"\\s*:\\s*\\[\\s*\\]");
+                            return runningEmpty && pendingEmpty;
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public static bool FreeComfyUiMemoryAtEndpoint(string baseUrl)
+        {
+            if (!ProbeComfyUiIdle(baseUrl)) return false;
+            try
+            {
+                byte[] payload = Encoding.UTF8.GetBytes("{\"unload_models\":true,\"free_memory\":true}");
+                System.Net.HttpWebRequest req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(baseUrl.TrimEnd('/') + "/free");
+                req.Method = "POST";
+                req.ContentType = "application/json";
+                req.ContentLength = payload.Length;
+                req.Timeout = 1100;
+                req.ReadWriteTimeout = 1100;
+                req.Proxy = null;
+                req.ServicePoint.Expect100Continue = false;
+                using (System.IO.Stream reqSt = req.GetRequestStream())
+                {
+                    reqSt.Write(payload, 0, payload.Length);
+                }
+                using (System.Net.HttpWebResponse resp = (System.Net.HttpWebResponse)req.GetResponse())
+                {
+                    return (int)resp.StatusCode >= 200 && (int)resp.StatusCode < 300;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public static int EvictAllIdleAiModels(bool gpuBusy)
+        {
+            if (gpuBusy) return 0;
+            int totalUnloaded = 0;
+
+            if (NativeApi.IsLoopbackTcpPortListening(11434) || IsOllamaDaemonPresent())
+            {
+                totalUnloaded += EvictOllamaModelsAtEndpoint("http://127.0.0.1:11434");
+            }
+
+            if (IsLmStudioActive())
+            {
+                totalUnloaded += EvictLmStudioModelsAtEndpoint("http://127.0.0.1:1234");
+            }
+
+            if (IsComfyUiActive())
+            {
+                if (FreeComfyUiMemoryAtEndpoint("http://127.0.0.1:8188"))
+                {
+                    totalUnloaded += 1;
+                }
+            }
+
+            return totalUnloaded;
+        }
+
         public static Dictionary<int, long> QueryPerPidDedicatedVramPdh()
         {
+            Dictionary<int, long> dummyShared;
+            return QueryPerPidGpuMemoryPdh(out dummyShared);
+        }
+
+        public static Dictionary<int, long> QueryPerPidGpuMemoryPdh(out Dictionary<int, long> sharedByPid)
+        {
             Dictionary<int, long> vramByPid = new Dictionary<int, long>();
+            sharedByPid = new Dictionary<int, long>();
             lock (Sync)
             {
                 try
@@ -325,6 +717,12 @@ namespace Legram
                             {
                                 persistentPdhQuery = hQ;
                                 persistentPdhCounter = hC;
+
+                                IntPtr hShared;
+                                if (NativeApi.PdhAddEnglishCounterW(hQ, @"\GPU Process Memory(*)\Shared Usage", IntPtr.Zero, out hShared) == 0)
+                                {
+                                    persistentPdhSharedCounter = hShared;
+                                }
                             }
                             else
                             {
@@ -339,42 +737,10 @@ namespace Legram
                     if (NativeApi.PdhCollectQueryData(persistentPdhQuery) != 0)
                         return vramByPid;
 
-                    uint bufSize = 0;
-                    uint itemCount = 0;
-                    uint st = NativeApi.PdhGetFormattedCounterArrayW(persistentPdhCounter, NativeApi.PDH_FMT_LARGE, ref bufSize, out itemCount, IntPtr.Zero);
-                    if (st == NativeApi.PDH_MORE_DATA && bufSize > 0)
+                    ReadPdhCounterByPid(persistentPdhCounter, vramByPid);
+                    if (persistentPdhSharedCounter != IntPtr.Zero)
                     {
-                        IntPtr pItems = Marshal.AllocHGlobal((int)bufSize);
-                        try
-                        {
-                            if (NativeApi.PdhGetFormattedCounterArrayW(persistentPdhCounter, NativeApi.PDH_FMT_LARGE, ref bufSize, out itemCount, pItems) == 0)
-                            {
-                                int itemSz = Marshal.SizeOf(typeof(NativeApi.PDH_FMT_COUNTERVALUE_ITEM_W));
-                                for (int i = 0; i < (int)itemCount; i++)
-                                {
-                                    IntPtr ptr = new IntPtr(pItems.ToInt64() + (long)(i * itemSz));
-                                    NativeApi.PDH_FMT_COUNTERVALUE_ITEM_W item =
-                                        (NativeApi.PDH_FMT_COUNTERVALUE_ITEM_W)Marshal.PtrToStructure(ptr, typeof(NativeApi.PDH_FMT_COUNTERVALUE_ITEM_W));
-                                    if (item.FmtValue.largeValue <= 0) continue;
-                                    string inst = Marshal.PtrToStringUni(item.szName);
-                                    if (inst != null && inst.StartsWith("pid_", StringComparison.OrdinalIgnoreCase))
-                                    {
-                                        int us = inst.IndexOf('_', 4);
-                                        int pidVal;
-                                        if (us > 4 && int.TryParse(inst.Substring(4, us - 4), out pidVal))
-                                        {
-                                            long cur;
-                                            if (!vramByPid.TryGetValue(pidVal, out cur)) cur = 0;
-                                            vramByPid[pidVal] = cur + item.FmtValue.largeValue;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        finally
-                        {
-                            Marshal.FreeHGlobal(pItems);
-                        }
+                        ReadPdhCounterByPid(persistentPdhSharedCounter, sharedByPid);
                     }
                 }
                 catch
@@ -382,6 +748,48 @@ namespace Legram
                 }
             }
             return vramByPid;
+        }
+
+        private static void ReadPdhCounterByPid(IntPtr counter, Dictionary<int, long> targetByPid)
+        {
+            if (counter == IntPtr.Zero) return;
+            uint bufSize = 0;
+            uint itemCount = 0;
+            uint st = NativeApi.PdhGetFormattedCounterArrayW(counter, NativeApi.PDH_FMT_LARGE, ref bufSize, out itemCount, IntPtr.Zero);
+            if (st == NativeApi.PDH_MORE_DATA && bufSize > 0)
+            {
+                IntPtr pItems = Marshal.AllocHGlobal((int)bufSize);
+                try
+                {
+                    if (NativeApi.PdhGetFormattedCounterArrayW(counter, NativeApi.PDH_FMT_LARGE, ref bufSize, out itemCount, pItems) == 0)
+                    {
+                        int itemSz = Marshal.SizeOf(typeof(NativeApi.PDH_FMT_COUNTERVALUE_ITEM_W));
+                        for (int i = 0; i < (int)itemCount; i++)
+                        {
+                            IntPtr ptr = new IntPtr(pItems.ToInt64() + (long)(i * itemSz));
+                            NativeApi.PDH_FMT_COUNTERVALUE_ITEM_W item =
+                                (NativeApi.PDH_FMT_COUNTERVALUE_ITEM_W)Marshal.PtrToStructure(ptr, typeof(NativeApi.PDH_FMT_COUNTERVALUE_ITEM_W));
+                            if (item.FmtValue.largeValue <= 0) continue;
+                            string inst = Marshal.PtrToStringUni(item.szName);
+                            if (inst != null && inst.StartsWith("pid_", StringComparison.OrdinalIgnoreCase))
+                            {
+                                int us = inst.IndexOf('_', 4);
+                                int pidVal;
+                                if (us > 4 && int.TryParse(inst.Substring(4, us - 4), out pidVal))
+                                {
+                                    long cur;
+                                    if (!targetByPid.TryGetValue(pidVal, out cur)) cur = 0;
+                                    targetByPid[pidVal] = cur + item.FmtValue.largeValue;
+                                }
+                            }
+                        }
+                    }
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(pItems);
+                }
+            }
         }
 
         private static bool IsBrowserGpuSubprocessZeroWmi(int pid)
@@ -433,6 +841,7 @@ namespace Legram
                     try { NativeApi.PdhCloseQuery(persistentPdhQuery); } catch { }
                     persistentPdhQuery = IntPtr.Zero;
                     persistentPdhCounter = IntPtr.Zero;
+                    persistentPdhSharedCounter = IntPtr.Zero;
                 }
             }
         }

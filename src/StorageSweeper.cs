@@ -197,10 +197,38 @@ namespace Legram
             return est;
         }
 
+        private static bool IsProcessRunningSafe(string procName)
+        {
+            try
+            {
+                Process[] procs = Process.GetProcessesByName(procName);
+                bool running = procs.Length > 0;
+                for (int i = 0; i < procs.Length; i++)
+                {
+                    try { procs[i].Dispose(); } catch { }
+                }
+                return running;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool IsProtectedTempEntry(string nameLower)
+        {
+            if (string.IsNullOrEmpty(nameLower)) return false;
+            return nameLower.Contains("wigram")
+                || nameLower.Contains("t3")
+                || nameLower.Contains("cbm")
+                || nameLower.Contains("antigravity")
+                || nameLower.Contains("legram");
+        }
+
         private static SweepEstimate ComputeJunkEstimate(List<DriveSnapshot> drives)
         {
             SweepEstimate est = new SweepEstimate();
-            est.PhotoshopRunning = Process.GetProcessesByName("Photoshop").Length > 0;
+            est.PhotoshopRunning = IsProcessRunningSafe("Photoshop");
 
             // 1. Recycle Bin across all volumes
             try
@@ -224,7 +252,19 @@ namespace Legram
             est.CrashDumpBytes += SumDirectoryFilesOlderThan(Path.Combine(localApp, "CrashDumps"), DateTime.UtcNow.AddHours(-2), 1);
             est.CrashDumpBytes += SumDirectoryFilesOlderThan(Path.Combine(localApp, @"Temp\DiagOutputDir\RdClientAutoTrace"), cutoffUtc, 1);
 
-            // 4. Orphaned Photoshop Temp* scratch files on real physical drives ONLY
+            // 4. Windows Error Reporting (WER) archives older than 7 days
+            DateTime cutoff7dUtc = DateTime.UtcNow.AddDays(-7);
+            est.WerArchiveBytes += SumDirectoryFilesOlderThan(Path.Combine(localApp, @"Microsoft\Windows\WER\ReportArchive"), cutoff7dUtc, 2);
+            est.WerArchiveBytes += SumDirectoryFilesOlderThan(Path.Combine(localApp, @"Microsoft\Windows\WER\ReportQueue"), cutoff7dUtc, 2);
+
+            // 5. Stale DirectX Shader Cache (30d), SquirrelTemp (7d), and Squirrel/Electron updater .nupkg archives (14d)
+            DateTime cutoff30dUtc = DateTime.UtcNow.AddDays(-30);
+            DateTime cutoff14dUtc = DateTime.UtcNow.AddDays(-14);
+            est.StaleShaderAndUpdaterBytes += SumDirectoryFilesOlderThan(Path.Combine(localApp, "D3DSCache"), cutoff30dUtc, 2);
+            est.StaleShaderAndUpdaterBytes += SumDirectoryFilesOlderThan(Path.Combine(localApp, "SquirrelTemp"), cutoff7dUtc, 2);
+            est.StaleShaderAndUpdaterBytes += SumStaleSquirrelNupkgBytes(localApp, cutoff14dUtc);
+
+            // 6. Orphaned Photoshop Temp* scratch files on real physical drives ONLY
             if (drives != null)
             {
                 for (int i = 0; i < drives.Count; i++)
@@ -246,6 +286,83 @@ namespace Legram
             return est;
         }
 
+        private static long SumStaleSquirrelNupkgBytes(string localApp, DateTime cutoffUtc)
+        {
+            if (string.IsNullOrEmpty(localApp) || !Directory.Exists(localApp)) return 0;
+            long sum = 0;
+            try
+            {
+                string[] appDirs = Directory.GetDirectories(localApp);
+                for (int i = 0; i < appDirs.Length; i++)
+                {
+                    try
+                    {
+                        string name = Path.GetFileName(appDirs[i]).ToLowerInvariant();
+                        if (name == "packages" || name.Contains("wigram") || name.Contains("t3") || name.Contains("cbm") || name.Contains("antigravity"))
+                            continue;
+                        string pkgDir = Path.Combine(appDirs[i], "packages");
+                        if (!Directory.Exists(pkgDir)) continue;
+                        string[] nupkgs = Directory.GetFiles(pkgDir, "*.nupkg");
+                        for (int k = 0; k < nupkgs.Length; k++)
+                        {
+                            try
+                            {
+                                if (!string.Equals(Path.GetExtension(nupkgs[k]), ".nupkg", StringComparison.OrdinalIgnoreCase))
+                                    continue;
+                                FileInfo fi = new FileInfo(nupkgs[k]);
+                                if (fi.LastWriteTimeUtc < cutoffUtc) sum += fi.Length;
+                            }
+                            catch { }
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+            return sum;
+        }
+
+        private static long DeleteStaleSquirrelNupkgFiles(string localApp, DateTime cutoffUtc)
+        {
+            if (string.IsNullOrEmpty(localApp) || !Directory.Exists(localApp)) return 0;
+            long freed = 0;
+            try
+            {
+                string[] appDirs = Directory.GetDirectories(localApp);
+                for (int i = 0; i < appDirs.Length; i++)
+                {
+                    try
+                    {
+                        string name = Path.GetFileName(appDirs[i]).ToLowerInvariant();
+                        if (name == "packages" || name.Contains("wigram") || name.Contains("t3") || name.Contains("cbm") || name.Contains("antigravity"))
+                            continue;
+                        string pkgDir = Path.Combine(appDirs[i], "packages");
+                        if (!Directory.Exists(pkgDir)) continue;
+                        string[] nupkgs = Directory.GetFiles(pkgDir, "*.nupkg");
+                        for (int k = 0; k < nupkgs.Length; k++)
+                        {
+                            try
+                            {
+                                if (!string.Equals(Path.GetExtension(nupkgs[k]), ".nupkg", StringComparison.OrdinalIgnoreCase))
+                                    continue;
+                                FileInfo fi = new FileInfo(nupkgs[k]);
+                                if (fi.LastWriteTimeUtc < cutoffUtc)
+                                {
+                                    long len = fi.Length;
+                                    fi.Delete();
+                                    freed += len;
+                                }
+                            }
+                            catch { }
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+            return freed;
+        }
+
         private static long SumDirectoryFilesOlderThan(string rootDir, DateTime cutoffUtc, int maxDepth)
         {
             if (string.IsNullOrEmpty(rootDir) || !Directory.Exists(rootDir)) return 0;
@@ -257,6 +374,8 @@ namespace Legram
                 {
                     try
                     {
+                        string fn = Path.GetFileName(files[i]).ToLowerInvariant();
+                        if (IsProtectedTempEntry(fn)) continue;
                         FileInfo fi = new FileInfo(files[i]);
                         if (fi.LastWriteTimeUtc < cutoffUtc) sum += fi.Length;
                     }
@@ -269,7 +388,7 @@ namespace Legram
                     for (int i = 0; i < subDirs.Length; i++)
                     {
                         string name = Path.GetFileName(subDirs[i]).ToLowerInvariant();
-                        if (name.Contains("wigram") || name.Contains("t3") || name.Contains("cbm") || name.Contains("antigravity"))
+                        if (IsProtectedTempEntry(name))
                             continue;
                         sum += SumDirectoryFilesOlderThan(subDirs[i], cutoffUtc, maxDepth - 1);
                     }
@@ -282,7 +401,7 @@ namespace Legram
         public static long ExecuteSafeSweep(List<DriveSnapshot> drives)
         {
             long freedBytes = 0;
-            bool photoshopRunning = Process.GetProcessesByName("Photoshop").Length > 0;
+            bool photoshopRunning = IsProcessRunningSafe("Photoshop");
 
             // 1. Empty Recycle Bin silently (SHERB_NOCONFIRMATION=1 | SHERB_NOPROGRESSUI=2 | SHERB_NOSOUND=4 = 7)
             try
@@ -309,7 +428,19 @@ namespace Legram
             freedBytes += DeleteFilesOlderThan(Path.Combine(localApp, "CrashDumps"), DateTime.UtcNow.AddHours(-2), 1);
             freedBytes += DeleteFilesOlderThan(Path.Combine(localApp, @"Temp\DiagOutputDir\RdClientAutoTrace"), cutoffUtc, 1);
 
-            // 4. Delete orphaned Photoshop Temp* ONLY if Photoshop is NOT running
+            // 4. Delete Windows Error Reporting (WER) archives older than 7 days
+            DateTime cutoff7dUtc = DateTime.UtcNow.AddDays(-7);
+            freedBytes += DeleteFilesOlderThan(Path.Combine(localApp, @"Microsoft\Windows\WER\ReportArchive"), cutoff7dUtc, 2);
+            freedBytes += DeleteFilesOlderThan(Path.Combine(localApp, @"Microsoft\Windows\WER\ReportQueue"), cutoff7dUtc, 2);
+
+            // 5. Delete stale DirectX Shader Cache (30d), SquirrelTemp (7d), and Squirrel/Electron updater .nupkg archives (14d)
+            DateTime cutoff30dUtc = DateTime.UtcNow.AddDays(-30);
+            DateTime cutoff14dUtc = DateTime.UtcNow.AddDays(-14);
+            freedBytes += DeleteFilesOlderThan(Path.Combine(localApp, "D3DSCache"), cutoff30dUtc, 2);
+            freedBytes += DeleteFilesOlderThan(Path.Combine(localApp, "SquirrelTemp"), cutoff7dUtc, 2);
+            freedBytes += DeleteStaleSquirrelNupkgFiles(localApp, cutoff14dUtc);
+
+            // 6. Delete orphaned Photoshop Temp* ONLY if Photoshop is NOT running
             if (!photoshopRunning && drives != null)
             {
                 for (int i = 0; i < drives.Count; i++)
@@ -353,6 +484,8 @@ namespace Legram
                 {
                     try
                     {
+                        string fn = Path.GetFileName(files[i]).ToLowerInvariant();
+                        if (IsProtectedTempEntry(fn)) continue;
                         FileInfo fi = new FileInfo(files[i]);
                         if (fi.LastWriteTimeUtc < cutoffUtc)
                         {
@@ -370,7 +503,7 @@ namespace Legram
                     for (int i = 0; i < subDirs.Length; i++)
                     {
                         string name = Path.GetFileName(subDirs[i]).ToLowerInvariant();
-                        if (name.Contains("wigram") || name.Contains("t3") || name.Contains("cbm") || name.Contains("antigravity"))
+                        if (IsProtectedTempEntry(name))
                             continue;
                         freed += DeleteFilesOlderThan(subDirs[i], cutoffUtc, maxDepth - 1);
                         try

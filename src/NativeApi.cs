@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows;
@@ -40,8 +41,16 @@ namespace Legram
         internal const int WS_EX_TOOLWINDOW = 0x00000080;
         internal const int WS_EX_NOACTIVATE = 0x08000000;
         internal const int WM_MOUSEACTIVATE = 0x0021;
+        internal const int WM_DISPLAYCHANGE = 0x007E;
+        internal const int WM_POWERBROADCAST = 0x0218;
         internal const int WM_DPICHANGED = 0x02E0;
+        internal const int PBT_APMSUSPEND = 0x0004;
+        internal const int PBT_APMRESUMESUSPEND = 0x0007;
+        internal const int PBT_APMRESUMEAUTOMATIC = 0x0012;
         internal const int MA_NOACTIVATE = 3;
+        internal const uint CREATE_BREAKAWAY_FROM_JOB = 0x01000000;
+        internal const uint CREATE_NO_WINDOW = 0x08000000;
+        internal const uint DETACHED_PROCESS = 0x00000008;
         internal const uint SWP_NOSIZE = 0x0001;
         internal const uint SWP_NOMOVE = 0x0002;
         internal const uint SWP_NOZORDER = 0x0004;
@@ -194,10 +203,195 @@ namespace Legram
         internal static extern bool SetProcessInformation(IntPtr hProcess, int ProcessInformationClass, ref MEMORY_PRIORITY_INFORMATION Info, uint Size);
 
         [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern bool GetProcessInformation(IntPtr hProcess, int ProcessInformationClass, out MEMORY_PRIORITY_INFORMATION Info, uint Size);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
         internal static extern bool SetProcessInformation(IntPtr hProcess, int ProcessInformationClass, ref PROCESS_POWER_THROTTLING_STATE State, uint Size);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         internal static extern bool SetPriorityClass(IntPtr hProcess, uint dwPriorityClass);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern uint GetPriorityClass(IntPtr hProcess);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        internal static extern uint RegisterWindowMessageW(string lpString);
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        internal struct STARTUPINFOW
+        {
+            public uint cb;
+            public string lpReserved;
+            public string lpDesktop;
+            public string lpTitle;
+            public uint dwX;
+            public uint dwY;
+            public uint dwXSize;
+            public uint dwYSize;
+            public uint dwXCountChars;
+            public uint dwYCountChars;
+            public uint dwFillAttribute;
+            public uint dwFlags;
+            public ushort wShowWindow;
+            public ushort cbReserved2;
+            public IntPtr lpReserved2;
+            public IntPtr hStdInput;
+            public IntPtr hStdOutput;
+            public IntPtr hStdError;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct PROCESS_INFORMATION
+        {
+            public IntPtr hProcess;
+            public IntPtr hThread;
+            public uint dwProcessId;
+            public uint dwThreadId;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        internal static extern bool CreateProcessW(
+            string lpApplicationName,
+            StringBuilder lpCommandLine,
+            IntPtr lpProcessAttributes,
+            IntPtr lpThreadAttributes,
+            bool bInheritHandles,
+            uint dwCreationFlags,
+            IntPtr lpEnvironment,
+            string lpCurrentDirectory,
+            ref STARTUPINFOW lpStartupInfo,
+            out PROCESS_INFORMATION lpProcessInformation);
+
+        // Zero-System.Management detached process breakaway helper:
+        // 1. Tries direct Win32 CREATE_BREAKAWAY_FROM_JOB (<1 ms).
+        // 2. If the parent terminal Job Object forbids breakaway (KILL_ON_JOB_CLOSE without BREAKAWAY_OK),
+        //    delegates creation out-of-process via late-bound WbemScripting.SWbemLocator in the short-lived stub
+        //    so the long-running --detached Legram process stays 100% outside the job and never loads WMI!
+        internal static bool TrySpawnDetachedBreakaway(string commandLine, string workingDirectory)
+        {
+            if (string.IsNullOrEmpty(commandLine)) return false;
+
+            STARTUPINFOW si = new STARTUPINFOW();
+            si.cb = (uint)Marshal.SizeOf(typeof(STARTUPINFOW));
+            PROCESS_INFORMATION pi;
+            StringBuilder cmdBuf = new StringBuilder(commandLine);
+            if (CreateProcessW(
+                null, cmdBuf, IntPtr.Zero, IntPtr.Zero, false,
+                CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS | CREATE_NO_WINDOW,
+                IntPtr.Zero, workingDirectory, ref si, out pi))
+            {
+                if (pi.hThread != IntPtr.Zero) CloseHandle(pi.hThread);
+                if (pi.hProcess != IntPtr.Zero) CloseHandle(pi.hProcess);
+                return true;
+            }
+
+            object locator = null;
+            object svc = null;
+            object procClass = null;
+            try
+            {
+                Type locType = Type.GetTypeFromProgID("WbemScripting.SWbemLocator");
+                if (locType != null)
+                {
+                    locator = Activator.CreateInstance(locType);
+                    svc = locType.InvokeMember(
+                        "ConnectServer",
+                        System.Reflection.BindingFlags.InvokeMethod,
+                        null,
+                        locator,
+                        new object[] { ".", @"root\cimv2" });
+                    if (svc != null)
+                    {
+                        procClass = svc.GetType().InvokeMember(
+                            "Get",
+                            System.Reflection.BindingFlags.InvokeMethod,
+                            null,
+                            svc,
+                            new object[] { "Win32_Process" });
+                        if (procClass != null)
+                        {
+                            object[] wmiArgs = new object[] { commandLine, workingDirectory, null, null };
+                            object res = procClass.GetType().InvokeMember(
+                                "Create",
+                                System.Reflection.BindingFlags.InvokeMethod,
+                                null,
+                                procClass,
+                                wmiArgs);
+                            if (res != null && Convert.ToInt32(res) == 0)
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+            finally
+            {
+                if (procClass != null && Marshal.IsComObject(procClass)) { try { Marshal.FinalReleaseComObject(procClass); } catch { } }
+                if (svc != null && Marshal.IsComObject(svc)) { try { Marshal.FinalReleaseComObject(svc); } catch { } }
+                if (locator != null && Marshal.IsComObject(locator)) { try { Marshal.FinalReleaseComObject(locator); } catch { } }
+            }
+            return false;
+        }
+
+        // Ultra-fast (<0.1 ms) zero-socket TCP LISTEN port check (IPv4 + IPv6) so AI/ComfyUI/LM Studio probes never hang on closed ports
+        internal static bool IsLoopbackTcpPortListening(int targetPort)
+        {
+            if (targetPort <= 0 || targetPort > 65535) return false;
+            int size = 0;
+            GetExtendedTcpTable(IntPtr.Zero, ref size, false, 2, 3, 0);
+            if (size > 0)
+            {
+                IntPtr buf = Marshal.AllocHGlobal(size);
+                try
+                {
+                    if (GetExtendedTcpTable(buf, ref size, false, 2, 3, 0) == 0)
+                    {
+                        int count = Marshal.ReadInt32(buf);
+                        IntPtr rowPtr = new IntPtr(buf.ToInt64() + 4);
+                        for (int i = 0; i < count; i++)
+                        {
+                            int rawPort = Marshal.ReadInt32(rowPtr, 8);
+                            int port = ((rawPort & 0xFF) << 8) | ((rawPort >> 8) & 0xFF);
+                            if (port == targetPort) return true;
+                            rowPtr = new IntPtr(rowPtr.ToInt64() + 24);
+                        }
+                    }
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(buf);
+                }
+            }
+
+            int size6 = 0;
+            GetExtendedTcpTable(IntPtr.Zero, ref size6, false, 23, 3, 0);
+            if (size6 > 0)
+            {
+                IntPtr buf6 = Marshal.AllocHGlobal(size6);
+                try
+                {
+                    if (GetExtendedTcpTable(buf6, ref size6, false, 23, 3, 0) == 0)
+                    {
+                        int count = Marshal.ReadInt32(buf6);
+                        IntPtr rowPtr = new IntPtr(buf6.ToInt64() + 4);
+                        for (int i = 0; i < count; i++)
+                        {
+                            int rawPort = Marshal.ReadInt32(rowPtr, 20);
+                            int port = ((rawPort & 0xFF) << 8) | ((rawPort >> 8) & 0xFF);
+                            if (port == targetPort) return true;
+                            rowPtr = new IntPtr(rowPtr.ToInt64() + 56);
+                        }
+                    }
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(buf6);
+                }
+            }
+            return false;
+        }
 
         [DllImport("dnsapi.dll", EntryPoint = "DnsFlushResolverCache")]
         internal static extern uint DnsFlushResolverCache();
@@ -450,6 +644,9 @@ namespace Legram
         internal static extern bool GetCursorPos(out POINT pt);
 
         [DllImport("user32.dll")]
+        internal static extern uint GetWindowLongW(IntPtr hWnd, int nIndex);
+
+        [DllImport("user32.dll")]
         internal static extern IntPtr GetWindowLongPtrW(IntPtr hWnd, int nIndex);
 
         [DllImport("user32.dll")]
@@ -478,6 +675,74 @@ namespace Legram
 
         [DllImport("user32.dll")]
         internal static extern int GetSystemMetricsForDpi(int nIndex, uint dpi);
+
+        [DllImport("user32.dll")]
+        internal static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        internal static extern int GetClassNameW(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+
+        [DllImport("shell32.dll")]
+        internal static extern int SHQueryUserNotificationState(out int pquns);
+
+        // Passive, 100% Anti-Cheat safe fullscreen window / D3D game detector (never opens game process handle!)
+        internal static bool IsForegroundWindowFullscreen(IntPtr fgHwnd, out bool isD3dExclusive)
+        {
+            isD3dExclusive = false;
+            try
+            {
+                int quns = 0;
+                if (SHQueryUserNotificationState(out quns) == 0 && quns == 3) // QUNS_RUNNING_D3D_FULL_SCREEN = 3
+                {
+                    isD3dExclusive = true;
+                    return true;
+                }
+            }
+            catch { }
+
+            if (fgHwnd == IntPtr.Zero) return false;
+            try
+            {
+                StringBuilder clsSb = new StringBuilder(64);
+                if (GetClassNameW(fgHwnd, clsSb, clsSb.Capacity) > 0)
+                {
+                    string cls = clsSb.ToString();
+                    if (string.Equals(cls, "Progman", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(cls, "WorkerW", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(cls, "Shell_TrayWnd", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(cls, "XamlExplorerHostIslandWindow", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return false;
+                    }
+                }
+
+                RECT wr;
+                if (!GetWindowRect(fgHwnd, out wr)) return false;
+                int ww = wr.R - wr.L;
+                int wh = wr.B - wr.T;
+                if (ww < 640 || wh < 480) return false;
+
+                IntPtr hMon = MonitorFromWindow(fgHwnd, 2); // MONITOR_DEFAULTTONEAREST
+                if (hMon == IntPtr.Zero) return false;
+                MONITORINFO mi = new MONITORINFO { Size = Marshal.SizeOf(typeof(MONITORINFO)) };
+                if (!GetMonitorInfo(hMon, ref mi)) return false;
+
+                int mw = mi.Monitor.R - mi.Monitor.L;
+                int mh = mi.Monitor.B - mi.Monitor.T;
+                if (mw <= 0 || mh <= 0) return false;
+
+                // Covers entire physical monitor rectangle (including taskbar area -> borderless fullscreen / fullscreen game)
+                bool coversMonitor = wr.L <= mi.Monitor.L + 2
+                    && wr.T <= mi.Monitor.T + 2
+                    && wr.R >= mi.Monitor.R - 2
+                    && wr.B >= mi.Monitor.B - 2;
+                return coversMonitor;
+            }
+            catch
+            {
+                return false;
+            }
+        }
 
         [DllImport("dwmapi.dll")]
         internal static extern int DwmSetWindowAttribute(IntPtr hwnd, int dwAttribute, ref int pvAttribute, int cbAttribute);
@@ -704,6 +969,544 @@ namespace Legram
             {
                 if (enumerator != null) Marshal.FinalReleaseComObject(enumerator);
             }
+        }
+    }
+
+    // --- 8. Windows 10/11 Virtual Desktop Manager (IVirtualDesktopManager COM + Ordered Desktop Index & Auto-Follow) ---
+    internal sealed class VirtualDesktopState
+    {
+        public int ActiveDesktopNumber = 1;
+        public int TotalDesktopCount = 1;
+        public string ActiveDesktopName = "";
+        public Guid ActiveDesktopId = Guid.Empty;
+        public Dictionary<int, int> PidPrimaryDesktopNumber = new Dictionary<int, int>();
+        public HashSet<int> PidsOnActiveDesktop = new HashSet<int>();
+        public HashSet<int> PidsOnInactiveDesktops = new HashSet<int>();
+        public Dictionary<int, string> DesktopNamesByNumber = new Dictionary<int, string>();
+    }
+
+    internal static class VirtualDesktopShield
+    {
+        [ComImport, Guid("aa509086-5ca9-4c25-8f95-589d3c07b48a")]
+        private class VirtualDesktopManagerComObject { }
+
+        [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("a5cd92ff-29be-454c-8d04-d82879fb3f1b")]
+        private interface IVirtualDesktopManager
+        {
+            [PreserveSig]
+            int IsWindowOnCurrentVirtualDesktop(IntPtr topLevelWindow, [MarshalAs(UnmanagedType.Bool)] out bool onCurrentDesktop);
+            [PreserveSig]
+            int GetWindowDesktopId(IntPtr topLevelWindow, out Guid desktopId);
+            [PreserveSig]
+            int MoveWindowToDesktop(IntPtr topLevelWindow, [In] ref Guid desktopId);
+        }
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetWindowTextLengthW(IntPtr hWnd);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct INPUT
+        {
+            public uint type;
+            public KEYBDINPUT ki;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct KEYBDINPUT
+        {
+            public ushort wVk;
+            public ushort wScan;
+            public uint dwFlags;
+            public uint time;
+            public IntPtr dwExtraInfo;
+            public uint pad1;
+            public uint pad2;
+        }
+
+        private const uint INPUT_KEYBOARD = 1;
+        private const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
+        private const uint KEYEVENTF_KEYUP = 0x0002;
+        private const ushort VK_CONTROL = 0x11;
+        private const ushort VK_LWIN = 0x5B;
+        private const ushort VK_LEFT = 0x25;
+        private const ushort VK_RIGHT = 0x27;
+        private const ushort VK_D = 0x44;
+        private const ushort VK_F4 = 0x73;
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+        [DllImport("user32.dll")]
+        private static extern uint MapVirtualKeyW(uint uCode, uint uMapType);
+
+        private static readonly object Sync = new object();
+        private static readonly List<Guid> KnownDesktopOrder = new List<Guid>();
+        private static Guid LastKnownActiveGuid = Guid.Empty;
+        private static VirtualDesktopState CachedLightweightState;
+        private static DateTime CachedLightweightUtc = DateTime.MinValue;
+
+        public static void InvalidateCache()
+        {
+            lock (Sync)
+            {
+                CachedLightweightUtc = DateTime.MinValue;
+            }
+        }
+
+        // Event-driven cached lightweight Virtual Desktop state (avoids EnumWindows + COM + Registry every 4.5s when idle!)
+        public static VirtualDesktopState SampleLightweightCached(IntPtr legramHwnd)
+        {
+            lock (Sync)
+            {
+                if (CachedLightweightState != null && (DateTime.UtcNow - CachedLightweightUtc).TotalSeconds < 25.0)
+                {
+                    return CachedLightweightState;
+                }
+            }
+            VirtualDesktopState fresh = SampleAndFollow(legramHwnd, true);
+            lock (Sync)
+            {
+                CachedLightweightState = fresh;
+                CachedLightweightUtc = DateTime.UtcNow;
+            }
+            return fresh;
+        }
+
+        private static INPUT MakeKeyInput(ushort vk, bool keyUp)
+        {
+            uint flags = keyUp ? KEYEVENTF_KEYUP : 0u;
+            if (vk == VK_LWIN || vk == VK_LEFT || vk == VK_RIGHT)
+            {
+                flags |= KEYEVENTF_EXTENDEDKEY;
+            }
+            ushort scan = (ushort)(MapVirtualKeyW(vk, 0) & 0xFFFF);
+            INPUT inp = new INPUT();
+            inp.type = INPUT_KEYBOARD;
+            inp.ki.wVk = vk;
+            inp.ki.wScan = scan;
+            inp.ki.dwFlags = flags;
+            return inp;
+        }
+
+        private static void SendCtrlWinKey(ushort vkKey)
+        {
+            INPUT[] inputs = new INPUT[6];
+            int sz = Marshal.SizeOf(typeof(INPUT));
+            inputs[0] = MakeKeyInput(VK_CONTROL, false);
+            inputs[1] = MakeKeyInput(VK_LWIN, false);
+            inputs[2] = MakeKeyInput(vkKey, false);
+            inputs[3] = MakeKeyInput(vkKey, true);
+            inputs[4] = MakeKeyInput(VK_LWIN, true);
+            inputs[5] = MakeKeyInput(VK_CONTROL, true);
+            SendInput((uint)inputs.Length, inputs, sz);
+        }
+
+        // Creates a new Windows Virtual Desktop (Ctrl + Win + D) and switches to it smoothly
+        public static void CreateNewDesktopAndSwitch(IntPtr legramHwnd, Action onCompleted)
+        {
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    SendCtrlWinKey(VK_D);
+                    System.Threading.Thread.Sleep(240);
+                    SampleAndFollow(legramHwnd, true);
+                }
+                catch { }
+                if (onCompleted != null)
+                {
+                    try { onCompleted(); } catch { }
+                }
+            });
+        }
+
+        // Switches from the current Virtual Desktop to targetDesktopNumber (1-based) using smooth native Ctrl+Win+Left/Right
+        public static void SwitchToDesktopNumber(int targetDesktopNumber, IntPtr legramHwnd, Action onCompleted)
+        {
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    VirtualDesktopState cur = SampleAndFollow(legramHwnd, false);
+                    int currentNum = Math.Max(1, cur.ActiveDesktopNumber);
+                    int targetNum = Math.Max(1, Math.Min(cur.TotalDesktopCount, targetDesktopNumber));
+                    int delta = targetNum - currentNum;
+                    if (delta != 0)
+                    {
+                        ushort dirVk = delta > 0 ? VK_RIGHT : VK_LEFT;
+                        int steps = Math.Min(8, Math.Abs(delta));
+                        for (int s = 0; s < steps; s++)
+                        {
+                            SendCtrlWinKey(dirVk);
+                            System.Threading.Thread.Sleep(160);
+                        }
+                        System.Threading.Thread.Sleep(140);
+                    }
+                    SampleAndFollow(legramHwnd, true);
+                }
+                catch { }
+                if (onCompleted != null)
+                {
+                    try { onCompleted(); } catch { }
+                }
+            });
+        }
+
+        // Closes the current Virtual Desktop (Ctrl + Win + F4) and removes its GUID from KnownDesktopOrder
+        public static void CloseCurrentDesktop(IntPtr legramHwnd, Action onCompleted)
+        {
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    VirtualDesktopState cur = SampleAndFollow(legramHwnd, false);
+                    if (cur.TotalDesktopCount > 1)
+                    {
+                        Guid closingGuid = cur.ActiveDesktopId;
+                        SendCtrlWinKey(VK_F4);
+                        System.Threading.Thread.Sleep(260);
+                        lock (Sync)
+                        {
+                            if (closingGuid != Guid.Empty && KnownDesktopOrder.Count > 1)
+                            {
+                                KnownDesktopOrder.Remove(closingGuid);
+                            }
+                        }
+                        SampleAndFollow(legramHwnd, true);
+                    }
+                }
+                catch { }
+                if (onCompleted != null)
+                {
+                    try { onCompleted(); } catch { }
+                }
+            });
+        }
+
+        public static VirtualDesktopState SampleAndFollow(IntPtr legramHwnd, bool autoFollowLegramWindow)
+        {
+            VirtualDesktopState state = new VirtualDesktopState();
+            IVirtualDesktopManager vdm = null;
+            try
+            {
+                vdm = (IVirtualDesktopManager)(new VirtualDesktopManagerComObject());
+            }
+            catch
+            {
+                return state;
+            }
+
+            try
+            {
+                int selfPid = System.Diagnostics.Process.GetCurrentProcess().Id;
+                Dictionary<Guid, string> regNames = new Dictionary<Guid, string>();
+                Guid regCurrentGuid;
+                List<Guid> orderedGuids = ReadRegistryDesktopOrder(regNames, out regCurrentGuid);
+
+                lock (Sync)
+                {
+                    // Always synchronize KnownDesktopOrder with Explorer's authoritative VirtualDesktopIDs binary array when present
+                    if (orderedGuids.Count > 0)
+                    {
+                        KnownDesktopOrder.Clear();
+                        for (int i = 0; i < orderedGuids.Count; i++)
+                        {
+                            KnownDesktopOrder.Add(orderedGuids[i]);
+                        }
+                    }
+
+                    // 1. Primary source of truth for active desktop GUID: Explorer's live CurrentVirtualDesktop registry value
+                    Guid activeGuid = regCurrentGuid;
+
+                    // 2. Fallback: Foreground window on current desktop (excluding Legram itself)
+                    if (activeGuid == Guid.Empty)
+                    {
+                        IntPtr fg = NativeApi.GetForegroundWindow();
+                        if (fg != IntPtr.Zero && fg != legramHwnd)
+                        {
+                            bool onCur;
+                            Guid fgDesk;
+                            if (vdm.IsWindowOnCurrentVirtualDesktop(fg, out onCur) == 0 && onCur
+                                && vdm.GetWindowDesktopId(fg, out fgDesk) == 0 && fgDesk != Guid.Empty
+                                && !IsPinnedToAllDesktopsGuid(fgDesk))
+                            {
+                                activeGuid = fgDesk;
+                            }
+                        }
+                    }
+
+                    List<IntPtr> candidateHwnds = new List<IntPtr>(64);
+                    EnumWindowsProc callback = delegate(IntPtr hWnd, IntPtr lParam)
+                    {
+                        if (hWnd == IntPtr.Zero || hWnd == legramHwnd) return true;
+                        if (!IsWindowVisible(hWnd)) return true;
+
+                        uint exStyle = NativeApi.GetWindowLongW(hWnd, NativeApi.GWL_EXSTYLE);
+                        if ((exStyle & NativeApi.WS_EX_TOOLWINDOW) != 0) return true;
+
+                        candidateHwnds.Add(hWnd);
+                        return true;
+                    };
+                    EnumWindows(callback, IntPtr.Zero);
+                    GC.KeepAlive(callback);
+
+                    // First pass: find activeGuid from any window on the current virtual desktop if still empty
+                    for (int i = 0; i < candidateHwnds.Count; i++)
+                    {
+                        IntPtr hWnd = candidateHwnds[i];
+                        if (GetWindowTextLengthW(hWnd) <= 0) continue;
+
+                        bool onCur = false;
+                        Guid deskId = Guid.Empty;
+                        int hr1 = vdm.IsWindowOnCurrentVirtualDesktop(hWnd, out onCur);
+                        int hr2 = vdm.GetWindowDesktopId(hWnd, out deskId);
+                        if (hr1 == 0 && hr2 == 0 && deskId != Guid.Empty && !IsPinnedToAllDesktopsGuid(deskId))
+                        {
+                            if (onCur && activeGuid == Guid.Empty)
+                            {
+                                activeGuid = deskId;
+                            }
+                        }
+                    }
+
+                    // Ensure activeGuid is registered FIRST when starting up so current desktop is always Desktop 1!
+                    if (activeGuid != Guid.Empty && !KnownDesktopOrder.Contains(activeGuid))
+                    {
+                        KnownDesktopOrder.Add(activeGuid);
+                    }
+
+                    // Second pass: classify active vs inactive desktop PIDs and assign desktop numbers
+                    for (int i = 0; i < candidateHwnds.Count; i++)
+                    {
+                        IntPtr hWnd = candidateHwnds[i];
+                        if (GetWindowTextLengthW(hWnd) <= 0) continue;
+
+                        uint wPid;
+                        NativeApi.GetWindowThreadProcessId(hWnd, out wPid);
+                        int pid = (int)wPid;
+                        if (pid <= 4 || pid == selfPid) continue;
+
+                        bool onCur = false;
+                        Guid deskId = Guid.Empty;
+                        int hr1 = vdm.IsWindowOnCurrentVirtualDesktop(hWnd, out onCur);
+                        int hr2 = vdm.GetWindowDesktopId(hWnd, out deskId);
+                        if (hr1 != 0) continue;
+
+                        if (hr2 == 0 && deskId != Guid.Empty && !IsPinnedToAllDesktopsGuid(deskId))
+                        {
+                            if (!KnownDesktopOrder.Contains(deskId))
+                            {
+                                KnownDesktopOrder.Add(deskId);
+                            }
+                        }
+
+                        if (onCur)
+                        {
+                            state.PidsOnActiveDesktop.Add(pid);
+                            state.PidsOnInactiveDesktops.Remove(pid);
+                            int deskNum = (hr2 == 0) ? GetOrAssignDesktopNumber(deskId) : 0;
+                            if (deskNum > 0) state.PidPrimaryDesktopNumber[pid] = deskNum;
+                        }
+                        else if (hr2 == 0 && deskId != Guid.Empty && !IsPinnedToAllDesktopsGuid(deskId))
+                        {
+                            // Window genuinely belongs to another Virtual Desktop GUID
+                            if (!state.PidsOnActiveDesktop.Contains(pid))
+                            {
+                                state.PidsOnInactiveDesktops.Add(pid);
+                            }
+                            int deskNum = GetOrAssignDesktopNumber(deskId);
+                            if (deskNum > 0 && !state.PidPrimaryDesktopNumber.ContainsKey(pid))
+                            {
+                                state.PidPrimaryDesktopNumber[pid] = deskNum;
+                            }
+                        }
+                    }
+
+                    if (activeGuid == Guid.Empty)
+                    {
+                        activeGuid = LastKnownActiveGuid;
+                    }
+                    if (activeGuid == Guid.Empty && KnownDesktopOrder.Count > 0)
+                    {
+                        activeGuid = KnownDesktopOrder[0];
+                    }
+                    if (activeGuid != Guid.Empty)
+                    {
+                        LastKnownActiveGuid = activeGuid;
+                        if (!KnownDesktopOrder.Contains(activeGuid))
+                        {
+                            KnownDesktopOrder.Add(activeGuid);
+                        }
+                    }
+
+                    state.TotalDesktopCount = Math.Max(1, KnownDesktopOrder.Count);
+                    state.ActiveDesktopId = activeGuid;
+                    int activeIdx = activeGuid != Guid.Empty ? KnownDesktopOrder.IndexOf(activeGuid) : 0;
+                    state.ActiveDesktopNumber = activeIdx >= 0 ? (activeIdx + 1) : 1;
+
+                    foreach (int actPid in state.PidsOnActiveDesktop)
+                    {
+                        if (!state.PidPrimaryDesktopNumber.ContainsKey(actPid))
+                        {
+                            state.PidPrimaryDesktopNumber[actPid] = state.ActiveDesktopNumber;
+                        }
+                    }
+                    if (state.TotalDesktopCount == 2)
+                    {
+                        int otherDesk = state.ActiveDesktopNumber == 1 ? 2 : 1;
+                        foreach (int inactPid in state.PidsOnInactiveDesktops)
+                        {
+                            if (!state.PidPrimaryDesktopNumber.ContainsKey(inactPid))
+                            {
+                                state.PidPrimaryDesktopNumber[inactPid] = otherDesk;
+                            }
+                        }
+                    }
+
+                    for (int i = 0; i < KnownDesktopOrder.Count; i++)
+                    {
+                        Guid g = KnownDesktopOrder[i];
+                        string nm;
+                        if (!regNames.TryGetValue(g, out nm) || string.IsNullOrEmpty(nm))
+                        {
+                            nm = "Desktop " + (i + 1);
+                        }
+                        state.DesktopNamesByNumber[i + 1] = nm;
+                    }
+                    string activeNm;
+                    if (state.DesktopNamesByNumber.TryGetValue(state.ActiveDesktopNumber, out activeNm))
+                    {
+                        state.ActiveDesktopName = activeNm;
+                    }
+                    else
+                    {
+                        state.ActiveDesktopName = "Desktop " + state.ActiveDesktopNumber;
+                    }
+
+                    // Keep Legram window effortlessly on the current active desktop when switching desktops
+                    if (autoFollowLegramWindow && legramHwnd != IntPtr.Zero && activeGuid != Guid.Empty)
+                    {
+                        bool legramOnCur = true;
+                        if (vdm.IsWindowOnCurrentVirtualDesktop(legramHwnd, out legramOnCur) == 0 && !legramOnCur)
+                        {
+                            vdm.MoveWindowToDesktop(legramHwnd, ref activeGuid);
+                        }
+                    }
+
+                    CachedLightweightState = state;
+                    CachedLightweightUtc = DateTime.UtcNow;
+                }
+            }
+            catch
+            {
+            }
+            finally
+            {
+                if (vdm != null)
+                {
+                    try { Marshal.FinalReleaseComObject(vdm); } catch { }
+                }
+            }
+            return state;
+        }
+
+        private static int GetOrAssignDesktopNumber(Guid deskId)
+        {
+            if (deskId == Guid.Empty || IsPinnedToAllDesktopsGuid(deskId)) return 0;
+            int idx = KnownDesktopOrder.IndexOf(deskId);
+            if (idx < 0)
+            {
+                KnownDesktopOrder.Add(deskId);
+                idx = KnownDesktopOrder.Count - 1;
+            }
+            return idx + 1;
+        }
+
+        private static bool IsPinnedToAllDesktopsGuid(Guid g)
+        {
+            // Windows uses sentinel GUIDs for windows pinned across all desktops
+            string s = g.ToString("N");
+            return s.StartsWith("c2ddea68", StringComparison.OrdinalIgnoreCase)
+                || s.StartsWith("bb64d5b7", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static List<Guid> ReadRegistryDesktopOrder(Dictionary<Guid, string> namesOut, out Guid currentGuidOut)
+        {
+            List<Guid> list = new List<Guid>();
+            currentGuidOut = Guid.Empty;
+            try
+            {
+                using (Microsoft.Win32.RegistryKey hkcu = Microsoft.Win32.RegistryKey.OpenBaseKey(
+                    Microsoft.Win32.RegistryHive.CurrentUser, Microsoft.Win32.RegistryView.Registry64))
+                using (Microsoft.Win32.RegistryKey vdKey = hkcu.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Explorer\VirtualDesktops"))
+                {
+                    if (vdKey == null) return list;
+
+                    // 1. Read authoritative CurrentVirtualDesktop GUID from Explorer
+                    byte[] rawCur = vdKey.GetValue("CurrentVirtualDesktop") as byte[];
+                    if (rawCur != null && rawCur.Length == 16)
+                    {
+                        Guid curG = new Guid(rawCur);
+                        if (curG != Guid.Empty) currentGuidOut = curG;
+                    }
+
+                    // 2. Read ordered desktop list from VirtualDesktopIDs if present (do NOT add orphaned Desktops\{GUID} wallpaper subkeys!)
+                    byte[] rawIds = vdKey.GetValue("VirtualDesktopIDs") as byte[];
+                    if (rawIds != null && rawIds.Length >= 16)
+                    {
+                        byte[] buf = new byte[16];
+                        for (int offset = 0; offset + 16 <= rawIds.Length; offset += 16)
+                        {
+                            Buffer.BlockCopy(rawIds, offset, buf, 0, 16);
+                            Guid g = new Guid(buf);
+                            if (g != Guid.Empty && !list.Contains(g)) list.Add(g);
+                        }
+                    }
+
+                    // 3. Read custom desktop names (if any) without polluting the active desktop list with stale subkeys
+                    using (Microsoft.Win32.RegistryKey desktopsKey = vdKey.OpenSubKey("Desktops"))
+                    {
+                        if (desktopsKey != null)
+                        {
+                            string[] subNames = desktopsKey.GetSubKeyNames();
+                            for (int i = 0; i < subNames.Length; i++)
+                            {
+                                Guid g;
+                                if (Guid.TryParse(subNames[i], out g) && g != Guid.Empty)
+                                {
+                                    using (Microsoft.Win32.RegistryKey oneDesk = desktopsKey.OpenSubKey(subNames[i]))
+                                    {
+                                        if (oneDesk != null)
+                                        {
+                                            string customName = oneDesk.GetValue("Name") as string;
+                                            if (!string.IsNullOrEmpty(customName))
+                                            {
+                                                namesOut[g] = customName;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch
+            {
+            }
+            return list;
         }
     }
 }

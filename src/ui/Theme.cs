@@ -171,6 +171,9 @@ namespace Legram
             "M6.2,12.2 L17.8,12.2");
         public static readonly Geometry CloseCrossGeom = ParseGeom(
             "M7.4,7.4 L16.6,16.6 M16.6,7.4 L7.4,16.6");
+        public static readonly Geometry GameControllerGeom = ParseGeom(
+            "M6.5,8.2 L17.5,8.2 C19.5,8.2 21,9.9 20.6,12.1 L19.8,16.4 C19.5,17.9 18,18.6 16.8,17.6 L14.5,15.5 L9.5,15.5 L7.2,17.6 C6,18.6 4.5,17.9 4.2,16.4 L3.4,12.1 C3,9.9 4.5,8.2 6.5,8.2 Z " +
+            "M7.2,11.8 L10.2,11.8 M8.7,10.3 L8.7,13.3 M15.4,11.2 L15.6,11.2 M17.2,12.6 L17.4,12.6");
 
         // 5. Three Layout Variant Icons (Monolith Vertical, Atelier Horizontal Deck, Optik Split Tuner)
         public static readonly Geometry LayoutMonolithGeom = ParseGeom(
@@ -455,7 +458,8 @@ namespace Legram
 
         public static ImageSource TryGet(ProcessGroupItem item)
         {
-            if (item == null || item.IsProtected || item.IsOrphanGroup) return null;
+            if (item == null || item.IsOrphanGroup || item.GroupKey == "protected-dev") return null;
+            if (item.IsProtected && !item.IsUserWhitelisted && string.IsNullOrEmpty(item.RepresentativeExePath)) return null;
             if (string.IsNullOrEmpty(item.GroupKey) || string.IsNullOrEmpty(item.RepresentativeExePath)) return null;
 
             lock (Sync)
@@ -590,6 +594,10 @@ namespace Legram
     // Dynamic Numeric Hardware Micro-Badge for System Tray (1% live RAM tabular readout + semantic status rim + Working state)
     public static class TrayGlyph
     {
+        private static readonly object GdiSync = new object();
+        private static System.Drawing.StringFormat cachedFormat;
+        private static readonly Dictionary<int, System.Drawing.Font> FontCacheByTenthPx = new Dictionary<int, System.Drawing.Font>();
+
         public static bool IsLightTaskbar()
         {
             try
@@ -696,15 +704,35 @@ namespace Legram
                 else
                 {
                     string txt = usedPercent.ToString(CultureInfo.InvariantCulture);
-                    float emPx = txt.Length >= 2 ? (size * 0.50f) : (size * 0.56f);
-                    using (System.Drawing.Font f = new System.Drawing.Font("Segoe UI", Math.Max(7.2f, emPx), System.Drawing.FontStyle.Bold, System.Drawing.GraphicsUnit.Pixel))
+                    float emPx = Math.Max(7.2f, txt.Length >= 2 ? (size * 0.50f) : (size * 0.56f));
+                    int keyTenthPx = (int)Math.Round(emPx * 10.0f);
                     using (System.Drawing.Brush txtB = new System.Drawing.SolidBrush(numColor))
-                    using (System.Drawing.StringFormat sf = new System.Drawing.StringFormat(System.Drawing.StringFormat.GenericTypographic))
                     {
-                        sf.Alignment = System.Drawing.StringAlignment.Center;
-                        sf.LineAlignment = System.Drawing.StringAlignment.Center;
                         System.Drawing.RectangleF rc = new System.Drawing.RectangleF(0, -size * 0.055f, size, size);
-                        g.DrawString(txt, f, txtB, rc, sf);
+                        lock (GdiSync)
+                        {
+                            if (cachedFormat == null)
+                            {
+                                cachedFormat = new System.Drawing.StringFormat(System.Drawing.StringFormat.GenericTypographic);
+                                cachedFormat.Alignment = System.Drawing.StringAlignment.Center;
+                                cachedFormat.LineAlignment = System.Drawing.StringAlignment.Center;
+                            }
+                            System.Drawing.Font cachedFont;
+                            if (!FontCacheByTenthPx.TryGetValue(keyTenthPx, out cachedFont))
+                            {
+                                if (FontCacheByTenthPx.Count > 12)
+                                {
+                                    foreach (System.Drawing.Font oldFont in FontCacheByTenthPx.Values)
+                                    {
+                                        try { oldFont.Dispose(); } catch { }
+                                    }
+                                    FontCacheByTenthPx.Clear();
+                                }
+                                cachedFont = new System.Drawing.Font("Segoe UI", keyTenthPx / 10.0f, System.Drawing.FontStyle.Bold, System.Drawing.GraphicsUnit.Pixel);
+                                FontCacheByTenthPx[keyTenthPx] = cachedFont;
+                            }
+                            g.DrawString(txt, cachedFont, txtB, rc, cachedFormat);
+                        }
                     }
                 }
             }

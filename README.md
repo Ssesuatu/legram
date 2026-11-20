@@ -2,12 +2,12 @@
   <img src="assets/legram-256.png" width="96" height="96" alt="Legram Icon" />
   <h1>Legram</h1>
   <p><strong>Precision Windows 10/11 RAM, GPU VRAM &amp; SSD Harmonizer</strong><br/>
-  Zero dependencies &middot; Single ~209 KB native x64 binary &middot; Zero foreground stutter</p>
+  Zero dependencies &middot; Single ~255 KB native x64 binary &middot; Zero foreground stutter</p>
 
   <p>
     <a href="https://github.com/Ssesuatu/legram/releases/latest"><img src="https://img.shields.io/github/v/release/Ssesuatu/legram?style=flat-square&color=10B981&label=download" alt="Latest Release" /></a>
     <img src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011%20(x64)-0078D4?style=flat-square" alt="Windows 10/11 x64" />
-    <img src="https://img.shields.io/badge/binary-~209%20KB%20native%20.exe-38BDF8?style=flat-square" alt="Binary Size" />
+    <img src="https://img.shields.io/badge/binary-~255%20KB%20native%20.exe-38BDF8?style=flat-square" alt="Binary Size" />
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-A7F3D0?style=flat-square" alt="MIT License" /></a>
   </p>
 </div>
@@ -34,11 +34,11 @@ Unlike traditional "RAM cleaners" that indiscriminately strip active working set
 
 ## Install (Portable)
 
-1. Download **`Legram-2.5.0-win-x64.zip`** from [Releases](https://github.com/Ssesuatu/legram/releases) and optionally verify it against `Legram-2.5.0-win-x64.zip.sha256`.
+1. Download **`Legram-2.6.0-win-x64.zip`** from [Releases](https://github.com/Ssesuatu/legram/releases) and optionally verify it against `Legram-2.6.0-win-x64.zip.sha256`.
 2. Extract it to any writable folder, for example `%LOCALAPPDATA%\Programs\Legram` (keep the `fonts` folder next to `Legram.exe`).
 3. Run **`Legram.exe`**.
-   - Double-click the header bar to fold into **Mini Capsule Mode**, or press **`Ctrl + Alt + L`** from anywhere to trigger a 1-Click Unified Harmony sweep.
-   - Right-click anywhere on the window (or the numeric system tray icon) to toggle **Launch at Windows Sign-In** (`--background`) or enable **0-UAC Kernel Standby Purge**.
+   - Double-click the header bar to fold into **Mini Capsule Mode**, press **`Ctrl + Alt + L`** to toggle the Legram window, or press **`Ctrl + Alt + H`** from anywhere to trigger a **Silent 1-Click Unified Harmony** sweep without leaving your active app.
+   - Right-click anywhere on the window (or the numeric system tray icon) to toggle **Launch at Windows Sign-In** (`--background`), **Game Mode Auto-Pause**, **Virtual Desktop Auto-Sleep**, or enable **0-UAC Kernel Standby Purge**.
 
 > **Note:** Releases are not code-signed yet, so Windows SmartScreen may ask you to confirm on first launch (**More info &rarr; Run anyway**).
 
@@ -56,17 +56,17 @@ Unlike traditional "RAM cleaners" that indiscriminately strip active working set
 - **Anti-Microstutter Trigger (ISLC Logic):** Automatically purges low-priority standby pages when `Available RAM < 1.5 GB` while `Standby Cache > 4.0 GB` — fixing frame-time spikes in games and heavy creative workloads before Windows scrambles for free frames.
 - **Virtual Commit Charge Protection:** Monitors total Windows Commit Charge (`Pagefile + Physical RAM`). Triggers proactive reclamation at `>= 85%` commit usage to prevent sudden `"Out of Memory"` crashes in browsers, IDEs, and AI runtimes even when physical RAM appears available.
 
-### 3. Windows 11 EcoQoS + Background I/O Saver
-- Applies **`PROCESS_POWER_THROTTLING_EXECUTION_SPEED`** (Efficiency Cores / EcoQoS) and **`IoPriorityHintVeryLow`** (`NtSetInformationProcess` Class `33`) to known background bloat, updaters, indexers, and idle helper processes.
-- Dynamically **restores normal QoS and I/O priority** the instant any window gains focus or enters the protected immunity graph.
+### 3. Windows 11 EcoQoS, Background I/O Saver & Virtual Desktop Sleep
+- Applies **`PROCESS_POWER_THROTTLING_EXECUTION_SPEED`** (Efficiency Cores / EcoQoS) and **`IoPriorityLow`** (`NtSetInformationProcess` Class `33`) to background bloat and inactive Virtual Desktop workspaces while keeping the entire foreground browser/app process tree and high-priority games (`HIGH_PRIORITY_CLASS`) 100% untouched.
+- Includes interactive `[1] [2] [+]` Virtual Desktop switcher pills with automatic window follow and 1-click user process immunity shields.
 
-### 4. GPU VRAM, DWM & Orphan AI / WSL Reclamation
-- **WDDM Per-Process VRAM Telemetry:** Tracks dedicated + shared GPU memory via native PDH `GPU Process Memory` counters without waking discrete GPUs via `nvidia-smi`.
-- **DWM Composition Leak Guard:** Gently trims `dwm.exe` only when Desktop Window Manager working set exceeds `450 MB` (common after multi-monitor sleep/wake or alt-tab cycles).
-- **Orphan AI & Idle WSL2 Cleanup:** Politely unloads idle Ollama models (`POST /api/generate` with `keep_alive: 0` when idle `> 10 min`), reclaims orphaned headless CLI workers whose parent terminal exited, and shrinks idle `vmmemWSL` allocations.
+### 4. Multi-Engine GPU VRAM, DWM & Non-Destructive WSL2 Reclamation
+- **WDDM Per-Category VRAM & Shared GPU Telemetry:** Tracks dedicated + shared GPU memory by category (*Compositor/DWM*, *Browser*, *AI/LLM*, *Apps/Games*) and auto-recovers NVML/PDH handles after S3 Sleep or GPU driver resets (`Win+Ctrl+Shift+B`).
+- **DWM Composition Leak Guard:** Gently trims `dwm.exe` working set when Desktop Window Manager bloats past `450 MB`.
+- **Multi-Engine AI Unloader & Non-Destructive WSL2 Reclaim:** Politely unloads idle **Ollama** (`:11434`), **LM Studio** (`:1234`), and **ComfyUI** (`:8188/free`) models when GPU utilization is idle, reaps orphaned headless workers, and drops **WSL2 Linux page caches** (`drop_caches`) without shutting down active Linux terminals or Docker containers.
 
 ### 5. Safe Physical SSD Sweep
-- Cleans stale files (`> 24 hours` untouched) across `%TEMP%`, browser HTTP/GPU shader caches, Windows Error Reporting (`WER`), crash dumps, Squirrel/Updater leftovers, and empties the Recycle Bin — skipping any locked file or active build artifact.
+- Cleans stale files across `%TEMP%` (`> 24h`), Windows Error Reporting (`WER` `> 7d`), crash dumps, stale DirectX shader & Squirrel updater archives (`> 14–30d`), orphaned Photoshop scratch files, and empties the Recycle Bin — skipping cloud/virtual drives and locked files automatically.
 
 ---
 

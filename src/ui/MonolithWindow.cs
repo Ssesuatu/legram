@@ -31,6 +31,14 @@ namespace Legram
         private readonly TextBlock guardStatusText;
         private readonly TextBlock guardTipBody;
 
+        private readonly Border deskPill;
+        private readonly Border[] deskNumberBtns = new Border[5];
+        private readonly TextBlock[] deskNumberTexts = new TextBlock[5];
+        private readonly Border deskAddBtn;
+        private readonly TextBlock deskAddText;
+        private readonly TextBlock deskTipBody;
+        private int currentActiveDeskNum = 1;
+
         private readonly WindowChromeButton minimizeBtn;
         private readonly WindowChromeButton closeBtn;
 
@@ -64,6 +72,10 @@ namespace Legram
         public event EventHandler OneButtonInvoked;
         public event EventHandler MinimizeRequested;
         public event Action<bool> CloseRequested;
+        public event Action<ProcessGroupItem> ProcessRowClicked;
+        public event Action<int> DesktopSwitchRequested;
+        public event EventHandler DesktopCreateRequested;
+        public event EventHandler DesktopCloseRequested;
         public event Action<MouseButtonEventArgs> SurfaceMouseDown;
         public event Action<MouseEventArgs> SurfaceMouseMove;
         public event Action<MouseButtonEventArgs> SurfaceMouseUp;
@@ -124,7 +136,7 @@ namespace Legram
                 Background = Brushes.Transparent
             };
 
-            // 1A. Brand Emblem + Autonomous Guard Pill + Minimize & Close Window Controls
+            // 1A. Brand Emblem + Autonomous Guard Pill + Interactive Virtual Desktop Bar [1][2][+] + Minimize & Close
             Grid topBar = new Grid { Margin = new Thickness(0, 0, 0, 12), Background = Brushes.Transparent };
             topBar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             topBar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
@@ -132,12 +144,12 @@ namespace Legram
             StackPanel brandRow = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
             brandLogo = new PrismaticLensMedallion(22);
             brandTitle = Theme.Text("LEGRAM", 10.5, FontWeights.Bold, Theme.Obsidian.InkPrimary);
-            brandTitle.Margin = new Thickness(7, 0, 7, 0);
+            brandTitle.Margin = new Thickness(6.5, 0, 6.5, 0);
 
             StackPanel guardInner = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
-            guardShieldIcon = Theme.StrokeIcon(Theme.ShieldGuardGeom, 11.5, Theme.Obsidian.Mint, 1.8);
-            guardShieldIcon.Margin = new Thickness(0, 0, 4.5, 0);
-            guardStatusText = Theme.Text("167 Safe", 9.0, FontWeights.SemiBold, Theme.Obsidian.InkSecondary);
+            guardShieldIcon = Theme.StrokeIcon(Theme.ShieldGuardGeom, 11.0, Theme.Obsidian.Mint, 1.8);
+            guardShieldIcon.Margin = new Thickness(0, 0, 3.8, 0);
+            guardStatusText = Theme.Text("167 Safe", 8.8, FontWeights.SemiBold, Theme.Obsidian.InkSecondary);
             guardInner.Children.Add(guardShieldIcon);
             guardInner.Children.Add(guardStatusText);
 
@@ -145,7 +157,8 @@ namespace Legram
             {
                 CornerRadius = new CornerRadius(9),
                 BorderThickness = new Thickness(1),
-                Padding = new Thickness(7, 2.5, 7, 2.5),
+                Padding = new Thickness(6.0, 2.5, 6.0, 2.5),
+                Margin = new Thickness(0, 0, 4.5, 0),
                 VerticalAlignment = VerticalAlignment.Center,
                 Child = guardInner
             };
@@ -154,9 +167,120 @@ namespace Legram
             guardTipBody.MaxWidth = 295;
             guardPill.ToolTip = Chrome.Tip(guardTipBody);
 
+            StackPanel deskInner = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            for (int i = 0; i < deskNumberBtns.Length; i++)
+            {
+                int deskIndex = i + 1;
+                TextBlock numTxt = Theme.Text(deskIndex.ToString(CultureInfo.InvariantCulture), 8.6, FontWeights.Bold, Theme.Obsidian.InkSecondary);
+                numTxt.HorizontalAlignment = HorizontalAlignment.Center;
+                numTxt.VerticalAlignment = VerticalAlignment.Center;
+                deskNumberTexts[i] = numTxt;
+
+                Border numBtn = new Border
+                {
+                    Width = 17,
+                    Height = 16,
+                    CornerRadius = new CornerRadius(5.5),
+                    BorderThickness = new Thickness(1),
+                    Margin = new Thickness(0, 0, 2.0, 0),
+                    Background = Brushes.Transparent,
+                    BorderBrush = Brushes.Transparent,
+                    Cursor = Cursors.Hand,
+                    Child = numTxt,
+                    Visibility = i == 0 ? Visibility.Visible : Visibility.Collapsed
+                };
+
+                int capturedIdx = i;
+                numBtn.MouseEnter += delegate
+                {
+                    if (capturedIdx + 1 != currentActiveDeskNum)
+                    {
+                        numBtn.Background = Theme.BrushHex(0x22FFFFFFu);
+                    }
+                };
+                numBtn.MouseLeave += delegate
+                {
+                    if (capturedIdx + 1 != currentActiveDeskNum)
+                    {
+                        numBtn.Background = Brushes.Transparent;
+                    }
+                };
+                numBtn.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e)
+                {
+                    e.Handled = true;
+                };
+                numBtn.MouseLeftButtonUp += delegate(object s, MouseButtonEventArgs e)
+                {
+                    e.Handled = true;
+                    Action<int> sw = DesktopSwitchRequested;
+                    if (sw != null) sw(deskIndex);
+                };
+                numBtn.MouseRightButtonUp += delegate(object s, MouseButtonEventArgs e)
+                {
+                    e.Handled = true;
+                    EventHandler cl = DesktopCloseRequested;
+                    if (cl != null) cl(this, EventArgs.Empty);
+                };
+
+                deskNumberBtns[i] = numBtn;
+                deskInner.Children.Add(numBtn);
+            }
+
+            deskAddText = Theme.Text("+", 9.5, FontWeights.Bold, Theme.Obsidian.InkSecondary);
+            deskAddText.HorizontalAlignment = HorizontalAlignment.Center;
+            deskAddText.VerticalAlignment = VerticalAlignment.Center;
+            deskAddText.Margin = new Thickness(0, -1, 0, 0);
+
+            deskAddBtn = new Border
+            {
+                Width = 17,
+                Height = 16,
+                CornerRadius = new CornerRadius(5.5),
+                BorderThickness = new Thickness(1),
+                Background = Brushes.Transparent,
+                BorderBrush = Brushes.Transparent,
+                Cursor = Cursors.Hand,
+                Child = deskAddText
+            };
+            deskAddBtn.MouseEnter += delegate
+            {
+                deskAddBtn.Background = Theme.BrushHex(0x22FFFFFFu);
+                Theme.Set(deskAddText, Theme.Obsidian.Mint);
+            };
+            deskAddBtn.MouseLeave += delegate
+            {
+                deskAddBtn.Background = Brushes.Transparent;
+                Theme.Set(deskAddText, Theme.Obsidian.InkSecondary);
+            };
+            deskAddBtn.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e)
+            {
+                e.Handled = true;
+            };
+            deskAddBtn.MouseLeftButtonUp += delegate(object s, MouseButtonEventArgs e)
+            {
+                e.Handled = true;
+                EventHandler cr = DesktopCreateRequested;
+                if (cr != null) cr(this, EventArgs.Empty);
+            };
+            deskInner.Children.Add(deskAddBtn);
+
+            deskPill = new Border
+            {
+                CornerRadius = new CornerRadius(8.5),
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(2.5, 2.0, 2.5, 2.0),
+                VerticalAlignment = VerticalAlignment.Center,
+                Child = deskInner
+            };
+            deskTipBody = Theme.Text("", 11, FontWeights.Normal, Theme.Obsidian.InkPrimary);
+            deskTipBody.TextWrapping = TextWrapping.Wrap;
+            deskTipBody.MaxWidth = 295;
+            deskPill.ToolTip = Chrome.Tip(deskTipBody);
+
             brandRow.Children.Add(brandLogo);
             brandRow.Children.Add(brandTitle);
             brandRow.Children.Add(guardPill);
+            brandRow.Children.Add(deskPill);
 
             StackPanel chromeBtns = new StackPanel
             {
@@ -306,7 +430,7 @@ namespace Legram
             ledgerHead.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
             ledgerHeadLeft = Theme.Text("ACTIVE MEMORY LEDGER", 8.5, FontWeights.Bold, Theme.Obsidian.InkMuted);
-            ledgerHeadRight = Theme.Text("AUTO-MANAGED", 8.5, FontWeights.SemiBold, Theme.Obsidian.InkMuted);
+            ledgerHeadRight = Theme.Text("CLICK ROW: SHIELD", 8.5, FontWeights.SemiBold, Theme.Obsidian.InkMuted);
             Grid.SetColumn(ledgerHeadRight, 1);
             ledgerHead.Children.Add(ledgerHeadLeft);
             ledgerHead.Children.Add(ledgerHeadRight);
@@ -315,6 +439,11 @@ namespace Legram
             for (int i = 0; i < 4; i++)
             {
                 EditorialLedgerRow r = new EditorialLedgerRow();
+                r.RowClicked += delegate(ProcessGroupItem clickedItem)
+                {
+                    Action<ProcessGroupItem> h = ProcessRowClicked;
+                    if (h != null) h(clickedItem);
+                };
                 ledgerRows[i] = r;
                 ledgerStack.Children.Add(r);
             }
@@ -373,6 +502,8 @@ namespace Legram
 
             guardPill.Background = pal.PillBadgeFill;
             guardPill.BorderBrush = pal.TileBorder;
+            deskPill.Background = pal.PillBadgeFill;
+            deskPill.BorderBrush = pal.TileBorder;
 
             Theme.Set(heroOverline, pal.InkMuted);
             Theme.Set(heroLeadZero, pal.LeadingZeroInk);
@@ -386,6 +517,7 @@ namespace Legram
             {
                 brandLogo.SetState(MemoryPressure.Healthy, false);
                 rulerGauge.SetState(pal, 0.58, 0.20, MemoryPressure.Healthy);
+                oneButton.SetSessionTelemetry("", 0, 0L);
                 oneButton.Apply(pal, MemoryPressure.Healthy, 0L, isWorking, celebrationText);
                 return;
             }
@@ -410,8 +542,14 @@ namespace Legram
 
             brandLogo.SetState(visPressure, !string.IsNullOrEmpty(celebrationText));
 
-            // 1. Header Guard & EcoQoS Pill (compact so [—] [×] always have clear space)
-            if (s.RenderShieldActive)
+            // 1. Header Guard Pill + Interactive Virtual Desktop Bar ([1] [2] [3] [+])
+            if (s.GameShieldActive)
+            {
+                guardShieldIcon.Stroke = pal.Ice;
+                Theme.Set(guardStatusText, "Game Shield");
+                Theme.Set(guardStatusText, pal.Ice);
+            }
+            else if (s.RenderShieldActive)
             {
                 guardShieldIcon.Stroke = pal.Amber;
                 Theme.Set(guardStatusText, "Render Shield");
@@ -420,11 +558,47 @@ namespace Legram
             else
             {
                 guardShieldIcon.Stroke = pal.Mint;
-                string ecoSuffix = s.EcoQosThrottledCount > 0 ? (" \u00B7 " + s.EcoQosThrottledCount + " Eco") : "";
-                Theme.Set(guardStatusText, s.ProtectedProcessCount + " Safe" + ecoSuffix);
+                Theme.Set(guardStatusText, s.ProtectedProcessCount + " Safe");
                 Theme.Set(guardStatusText, pal.InkSecondary);
             }
             Theme.Set(guardTipBody, s.GuardTooltipSummary);
+
+            int totalDesks = Math.Max(1, Math.Min(deskNumberBtns.Length, s.TotalDesktopCount));
+            int activeDesk = Math.Max(1, Math.Min(totalDesks, s.ActiveDesktopNumber));
+            currentActiveDeskNum = activeDesk;
+
+            for (int i = 0; i < deskNumberBtns.Length; i++)
+            {
+                int dNum = i + 1;
+                if (dNum <= totalDesks)
+                {
+                    deskNumberBtns[i].Visibility = Visibility.Visible;
+                    if (dNum == activeDesk)
+                    {
+                        deskNumberBtns[i].Background = Theme.BrushHex(0x2E7CE3A1u);
+                        deskNumberBtns[i].BorderBrush = Theme.BrushHex(0x917CE3A1u);
+                        Theme.Set(deskNumberTexts[i], pal.Mint);
+                    }
+                    else
+                    {
+                        deskNumberBtns[i].Background = Brushes.Transparent;
+                        deskNumberBtns[i].BorderBrush = Brushes.Transparent;
+                        Theme.Set(deskNumberTexts[i], s.SleepingDesktopAppCount > 0 ? pal.Ice : pal.InkSecondary);
+                    }
+                }
+                else
+                {
+                    deskNumberBtns[i].Visibility = Visibility.Collapsed;
+                }
+            }
+            deskAddBtn.Visibility = totalDesks < deskNumberBtns.Length ? Visibility.Visible : Visibility.Collapsed;
+            Theme.Set(deskAddText, pal.InkSecondary);
+
+            string baseDeskTip = !string.IsNullOrEmpty(s.VirtualDesktopTooltipSummary)
+                ? s.VirtualDesktopTooltipSummary
+                : ("Active Workspace: Desktop " + activeDesk + " of " + totalDesks);
+            Theme.Set(deskTipBody, baseDeskTip + "\n\u2022 Click [1], [2], [3] to switch desktop \u00B7 Click [+] to create new desktop"
+                + (totalDesks > 1 ? "\n\u2022 Right-click number to close current desktop" : ""));
 
             // 2. Hero Numeral + Leading Zero + Ruler + Unambiguous Split Math
             Brush sigBrush = pal.SignalBrush(s.Pressure);
@@ -489,11 +663,14 @@ namespace Legram
                 ramSubCol,
                 s.IsCommitCritical ? pal.Coral : pal.Ice);
 
+            string standbyP0Line = s.EstimatedStandbyZeroBytes > 0
+                ? ("\nStandby P0 Ready: " + Fmt.BytesShort(s.EstimatedStandbyZeroBytes))
+                : "";
             Theme.Set(ramTile.TipBody, string.Format(CultureInfo.InvariantCulture,
                 "Installed DIMM: {0} (Usable OS: {1}, HW Reserved: {2})\n" +
                 "Physical Used: {3} ({4}%) \u00B7 Available: {5}\n" +
                 "Commit Charge (RAM+Pagefile): {6} / {7} ({8}%)\n" +
-                "Kernel Standby: {9} (Low-Prio: {10}) \u00B7 Free+Zero: {11}\n" +
+                "Kernel Standby: {9} (Low-Prio: {10}) \u00B7 Free+Zero: {11}{15}\n" +
                 "Trimmable Working Set: {12} \u00B7 DWM: {13}\n" +
                 "Kernel Helper: {14}",
                 Fmt.BytesShort(s.InstalledDimmBytes > 0 ? s.InstalledDimmBytes : s.TotalRamBytes),
@@ -514,15 +691,24 @@ namespace Legram
                         + (s.DwmVramBytes > 0 ? (" RAM / " + Fmt.BytesShort(s.DwmVramBytes) + " VRAM") : "")
                         + (s.IsDwmBloated ? " [Bloated]" : " [Healthy]"))
                     : "Healthy",
-                s.KernelPurgeTaskReady ? "Active (0-UAC)" : "User-Space Mode (Right-click to enable 0-UAC Kernel Purge)"));
+                s.KernelPurgeTaskReady ? "Active (0-UAC)" : "User-Space Mode (Right-click to enable 0-UAC Kernel Purge)",
+                standbyP0Line));
 
-            // 3B. GPU Tile (Live NVML VRAM + Temperature + Idle Ollama Model Detector)
+            // 3B. GPU Tile (Live NVML VRAM + Temperature + Idle AI Engine Detector)
             if (s.Gpu != null && s.Gpu.Available)
             {
-                string gpuSub = s.Gpu.IdleOllamaModelCount > 0
-                    ? ("Ollama +" + Fmt.BytesCompactG(s.Gpu.IdleOllamaVramBytes))
-                    : (s.Gpu.TemperatureC + "\u00B0C \u00B7 GPU " + s.Gpu.GpuUtilPercent + "%");
-                bool gpuAlert = s.Gpu.IsHighAlert || s.Gpu.IdleOllamaModelCount > 0;
+                int aiCount = s.Gpu.IdleAiEngineCount > 0 ? s.Gpu.IdleAiEngineCount : s.Gpu.IdleOllamaModelCount;
+                long aiVram = s.Gpu.IdleAiVramBytes > 0 ? s.Gpu.IdleAiVramBytes : s.Gpu.IdleOllamaVramBytes;
+                string gpuSub;
+                if (aiCount > 0)
+                {
+                    gpuSub = aiVram > 0 ? ("AI Idle +" + Fmt.BytesCompactG(aiVram)) : "AI Ready";
+                }
+                else
+                {
+                    gpuSub = s.Gpu.TemperatureC + "\u00B0C \u00B7 GPU " + s.Gpu.GpuUtilPercent + "%";
+                }
+                bool gpuAlert = s.Gpu.IsHighAlert || aiCount > 0;
 
                 gpuTile.Apply(
                     pal,
@@ -533,18 +719,26 @@ namespace Legram
                     gpuAlert ? pal.Amber : pal.InkSecondary,
                     gpuAlert ? pal.Amber : pal.Mint);
 
+                string catLine = !string.IsNullOrEmpty(s.Gpu.CategoryBreakdownSummary)
+                    ? ("\n" + s.Gpu.CategoryBreakdownSummary)
+                    : "";
+                string topLine = !string.IsNullOrEmpty(s.Gpu.TopVramSummary)
+                    ? ("\n" + s.Gpu.TopVramSummary)
+                    : "";
                 Theme.Set(gpuTile.TipBody, string.Format(CultureInfo.InvariantCulture,
-                    "{0}\nVRAM Used: {1} / {2} ({3:F0}%) \u00B7 WDDM Reserved: {4}\n" +
-                    "Temp: {5}\u00B0C \u00B7 Power: {6:F1} W \u00B7 Core Util: {7}%\n{8}",
+                    "{0}\nVRAM Used: {1} / {2} ({3:F0}%) \u00B7 WDDM Reserved: {4} \u00B7 Shared GPU RAM: {5}\n" +
+                    "Temp: {6}\u00B0C \u00B7 Power: {7:F1} W \u00B7 Core Util: {8}%{9}{10}",
                     s.Gpu.Name,
                     Fmt.BytesShort(s.Gpu.VramUsedBytes),
                     Fmt.BytesShort(s.Gpu.VramTotalBytes),
                     s.Gpu.VramUsedPercent,
                     Fmt.BytesShort(s.Gpu.VramReservedBytes),
+                    Fmt.BytesShort(s.Gpu.SharedGpuUsedBytes),
                     s.Gpu.TemperatureC,
                     s.Gpu.PowerWatts,
                     s.Gpu.GpuUtilPercent,
-                    s.Gpu.TopVramSummary));
+                    catLine,
+                    topLine));
             }
             else
             {
@@ -610,7 +804,7 @@ namespace Legram
                 if (junkBytes > 0)
                 {
                     sb.AppendFormat(CultureInfo.InvariantCulture,
-                        "Safe Reclaimable Junk: {0} (Temp + Recycle Bin + CrashDumps)\n",
+                        "Safe Reclaimable Junk: {0} (Temp + Recycle Bin + CrashDumps/WER + Cache)\n",
                         Fmt.BytesShort(junkBytes));
                 }
                 bool headerVirtual = false;
@@ -638,6 +832,7 @@ namespace Legram
             }
 
             // 5. The One Button
+            oneButton.SetSessionTelemetry(s.LastHarmonizeSummary, s.SessionHarmonizeCount, s.SessionTotalFreedBytes);
             oneButton.Apply(pal, visPressure, s.EstimatedHarmonyGainBytes, isWorking, celebrationText);
         }
 
@@ -822,6 +1017,7 @@ namespace Legram
         private string lastTrayKey = "";
 
         private IntPtr hwnd = IntPtr.Zero;
+        private int taskbarCreatedMsg;
         private DispatcherTimer telemetryTimer;
         private DispatcherTimer celebrationTimer;
         private DispatcherTimer selfTrimTimer;
@@ -860,6 +1056,10 @@ namespace Legram
             monolithView.HeaderDoubleClicked += delegate { SetFoldedLens(true); };
             monolithView.MinimizeRequested += delegate { MinimizeWindow(); };
             monolithView.CloseRequested += delegate(bool forceExit) { CloseFromHeaderButton(forceExit); };
+            monolithView.ProcessRowClicked += ShowProcessRowMenu;
+            monolithView.DesktopSwitchRequested += delegate(int targetDesk) { engine.SwitchToDesktop(targetDesk); };
+            monolithView.DesktopCreateRequested += delegate { engine.CreateNewDesktop(); };
+            monolithView.DesktopCloseRequested += delegate { engine.CloseCurrentDesktop(); };
             monolithView.SurfaceMouseDown += delegate(MouseButtonEventArgs e) { OnSurfaceMouseDown(e, false); };
             monolithView.SurfaceMouseMove += OnSurfaceMouseMove;
             monolithView.SurfaceMouseUp += OnSurfaceMouseUpMonolith;
@@ -911,6 +1111,28 @@ namespace Legram
                 {
                     e.Handled = true;
                     MinimizeWindow();
+                }
+                else if (e.Key == Key.Space || e.Key == Key.Return)
+                {
+                    e.Handled = true;
+                    TriggerUnifiedHarmony();
+                }
+                else if (e.Key == Key.M && Keyboard.Modifiers == ModifierKeys.None)
+                {
+                    e.Handled = true;
+                    SetFoldedLens(!settings.FoldedLens);
+                }
+                else if (e.Key == Key.F5)
+                {
+                    e.Handled = true;
+                    engine.RefreshSnapshotAsync(true);
+                }
+                else if ((Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control
+                    && e.Key >= Key.D1 && e.Key <= Key.D5)
+                {
+                    int idx = (int)(e.Key - Key.D1) + 1;
+                    e.Handled = true;
+                    engine.SwitchToDesktop(idx);
                 }
             };
 
@@ -967,6 +1189,8 @@ namespace Legram
             hwnd = new WindowInteropHelper(this).Handle;
             if (hwnd != IntPtr.Zero)
             {
+                taskbarCreatedMsg = (int)NativeApi.RegisterWindowMessageW("TaskbarCreated");
+                engine.AttachWindowHwnd(hwnd);
                 SyncWindowChromeStyle();
                 HwndSource src = HwndSource.FromHwnd(hwnd);
                 if (src != null) src.AddHook(WndProc);
@@ -1045,7 +1269,33 @@ namespace Legram
 
         private IntPtr WndProc(IntPtr h, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
         {
-            if (msg == NativeApi.WM_DPICHANGED)
+            if (taskbarCreatedMsg != 0 && msg == taskbarCreatedMsg)
+            {
+                Dispatcher.BeginInvoke(new Action(delegate
+                {
+                    if (tray != null)
+                    {
+                        lastTrayKey = "";
+                        tray.Visible = false;
+                        tray.Visible = true;
+                        UpdateTrayIconAndTooltip(engine.Current);
+                    }
+                }));
+            }
+            else if (msg == NativeApi.WM_POWERBROADCAST)
+            {
+                int evt = wParam.ToInt32();
+                if (evt == NativeApi.PBT_APMRESUMEAUTOMATIC || evt == NativeApi.PBT_APMRESUMESUSPEND)
+                {
+                    engine.NotifySystemResume();
+                    Dispatcher.BeginInvoke(new Action(delegate
+                    {
+                        ClampInsideWorkArea(false);
+                        RefreshUi();
+                    }));
+                }
+            }
+            else if (msg == NativeApi.WM_DISPLAYCHANGE || msg == NativeApi.WM_DPICHANGED)
             {
                 Dispatcher.BeginInvoke(new Action(delegate { ClampInsideWorkArea(false); }));
             }
@@ -1128,7 +1378,17 @@ namespace Legram
             ScheduleSelfTrim(3);
         }
 
-        public async void TriggerUnifiedHarmony()
+        public void TriggerUnifiedHarmony()
+        {
+            RunHarmonyAsync("TriggerUnifiedHarmony");
+        }
+
+        public void TriggerSilentHarmonyFromHotkey()
+        {
+            RunHarmonyAsync("TriggerSilentHarmonyFromHotkey");
+        }
+
+        private async void RunHarmonyAsync(string logContext)
         {
             if (isHarmonizing) return;
             isHarmonizing = true;
@@ -1150,7 +1410,7 @@ namespace Legram
             catch (Exception ex)
             {
                 isHarmonizing = false;
-                Log.Error("TriggerUnifiedHarmony", ex);
+                Log.Error(logContext, ex);
                 RefreshUi();
             }
         }
@@ -1353,6 +1613,77 @@ namespace Legram
             }
         }
 
+        private void ShowProcessRowMenu(ProcessGroupItem item)
+        {
+            if (item == null) return;
+            if (contextMenu == null) contextMenu = Chrome.Menu();
+            contextMenu.Items.Clear();
+
+            HausPalette o = Theme.Obsidian;
+            if (item.IsProtected || string.Equals(item.GroupKey, "__protected__", StringComparison.OrdinalIgnoreCase))
+            {
+                contextMenu.Items.Add(Chrome.IconItem(
+                    Theme.ShieldGuardGeom, o.Mint,
+                    "System & Active Guard Shield", "Protected", o.Mint,
+                    delegate
+                    {
+                        ShowCelebration("Core OS & Active Apps are always immune", "Always Safe");
+                    }));
+            }
+            else
+            {
+                bool currentlyImmune = settings.IsGroupImmune(item.GroupKey);
+                contextMenu.Items.Add(Chrome.IconItem(
+                    Theme.ShieldGuardGeom,
+                    currentlyImmune ? o.Amber : o.Mint,
+                    currentlyImmune
+                        ? ("Remove Immune Shield (" + item.DisplayName + ")")
+                        : ("Keep " + item.DisplayName + " Immune (1-Click Shield)"),
+                    currentlyImmune ? "Unshield" : "Immune",
+                    currentlyImmune ? o.Amber : o.Mint,
+                    delegate
+                    {
+                        bool nowImmune = settings.ToggleGroupImmune(item.GroupKey);
+                        engine.RefreshCalmScreenAsync(true);
+                        ShowCelebration(
+                            nowImmune
+                                ? ("\uD83D\uDEE1 " + item.DisplayName + " is now Immune")
+                                : (item.DisplayName + " returned to Auto-Guard"),
+                            nowImmune ? "Immune On" : "Auto-Guard");
+                    }));
+
+                if (!currentlyImmune)
+                {
+                    contextMenu.Items.Add(Chrome.IconItem(
+                        Theme.HausBarsGeom,
+                        item.IsOrphanGroup ? o.Amber : o.Ice,
+                        item.IsOrphanGroup
+                            ? ("Reap " + item.DisplayName + " Processes")
+                            : ("Trim " + item.DisplayName + " Memory Now"),
+                        Fmt.Gb2(item.WorkingSetBytes),
+                        item.IsOrphanGroup ? o.Amber : o.Ice,
+                        async delegate
+                        {
+                            PurgeResult r = await engine.TrimOrKillProcessGroupAsync(item);
+                            if (r != null && r.Success)
+                            {
+                                ShowCelebration(r.SummaryText, r.PillToastText);
+                            }
+                        }));
+                }
+            }
+
+            contextMenu.Items.Add(Chrome.Line());
+            contextMenu.Items.Add(Chrome.IconItem(
+                Theme.BentoGridGeom, o.InkSecondary,
+                "All Legram Controls\u2026", null, null,
+                delegate { ShowMonolithMenu(); }));
+
+            contextMenu.PlacementTarget = rootHost;
+            contextMenu.Placement = PlacementMode.MousePoint;
+            contextMenu.IsOpen = true;
+        }
+
         private void ShowMonolithMenu()
         {
             if (contextMenu == null) contextMenu = Chrome.Menu();
@@ -1396,6 +1727,16 @@ namespace Legram
                 }));
 
             contextMenu.Items.Add(Chrome.IconItem(
+                Theme.GameControllerGeom, settings.GameModeAutoPause ? o.Ice : o.InkSecondary,
+                "Game Mode Auto-Pause (Fullscreen)", settings.GameModeAutoPause ? "On" : "Off", settings.GameModeAutoPause ? o.Ice : o.InkMuted,
+                delegate
+                {
+                    settings.GameModeAutoPause = !settings.GameModeAutoPause;
+                    settings.Save();
+                    engine.RefreshCalmScreenAsync(true);
+                }));
+
+            contextMenu.Items.Add(Chrome.IconItem(
                 Theme.EcoLeafGeom, settings.EcoQosEnabled ? o.Ice : o.InkSecondary,
                 "EcoQoS + Background I/O Saver", settings.EcoQosEnabled ? "On" : "Off", settings.EcoQosEnabled ? o.Ice : o.InkMuted,
                 delegate
@@ -1405,6 +1746,34 @@ namespace Legram
                     settings.Save();
                     engine.RefreshCalmScreenAsync(true);
                 }));
+
+            contextMenu.Items.Add(Chrome.IconItem(
+                Theme.BentoGridGeom, settings.VirtualDesktopSleepEnabled ? o.Ice : o.InkSecondary,
+                "Virtual Desktop Auto-Sleep", settings.VirtualDesktopSleepEnabled ? "On" : "Off", settings.VirtualDesktopSleepEnabled ? o.Ice : o.InkMuted,
+                delegate
+                {
+                    settings.VirtualDesktopSleepEnabled = !settings.VirtualDesktopSleepEnabled;
+                    ecoQos.VirtualDesktopSleep = settings.VirtualDesktopSleepEnabled;
+                    settings.Save();
+                    engine.RefreshCalmScreenAsync(true);
+                }));
+
+            System.Collections.Generic.HashSet<string> immuneSnap = settings.SnapshotImmuneGroups();
+            if (immuneSnap.Count > 0)
+            {
+                contextMenu.Items.Add(Chrome.IconItem(
+                    Theme.ShieldGuardGeom, o.Mint,
+                    "Clear User Immune Shields", immuneSnap.Count + " apps", o.Mint,
+                    delegate
+                    {
+                        foreach (string k in immuneSnap)
+                        {
+                            settings.SetGroupImmune(k, false);
+                        }
+                        engine.RefreshCalmScreenAsync(true);
+                        ShowCelebration("Cleared User Immune Shields", "Shields Reset");
+                    }));
+            }
 
             contextMenu.Items.Add(Chrome.IconItem(
                 Theme.KernelBoltGeom, taskReady ? o.Mint : o.Amber,
@@ -1482,18 +1851,26 @@ namespace Legram
 
             if (key != lastTrayKey)
             {
-                lastTrayKey = key;
                 System.Drawing.Icon old = currentTrayIcon;
+                System.Drawing.Icon nextIcon = null;
+                bool swapped = false;
                 try
                 {
-                    currentTrayIcon = TrayGlyph.Make(iconSize, snap.UsedRamPercent, p, light, isHarmonizing);
-                    tray.Icon = currentTrayIcon;
+                    nextIcon = TrayGlyph.Make(iconSize, snap.UsedRamPercent, p, light, isHarmonizing);
+                    tray.Icon = nextIcon;
+                    currentTrayIcon = nextIcon;
+                    lastTrayKey = key;
+                    swapped = true;
                 }
                 catch (Exception ex)
                 {
                     Log.Error("TrayGlyph.Make", ex);
+                    if (nextIcon != null && !ReferenceEquals(nextIcon, currentTrayIcon))
+                    {
+                        try { NativeApi.DestroyIcon(nextIcon.Handle); nextIcon.Dispose(); } catch { }
+                    }
                 }
-                if (old != null)
+                if (swapped && old != null && !ReferenceEquals(old, currentTrayIcon))
                 {
                     try { NativeApi.DestroyIcon(old.Handle); old.Dispose(); } catch { }
                 }
@@ -1520,9 +1897,13 @@ namespace Legram
                     selfTrimTimer.Stop();
                     System.Threading.ThreadPool.QueueUserWorkItem(delegate
                     {
-                        GpuVramMonitor.ClosePdhIfIdle();
-                        GC.Collect(2, GCCollectionMode.Optimized, false);
-                        NativeApi.SelfTrimWorkingSet();
+                        try
+                        {
+                            GpuVramMonitor.ClosePdhIfIdle();
+                            GC.Collect(2, GCCollectionMode.Optimized, false);
+                            NativeApi.SelfTrimWorkingSet();
+                        }
+                        catch { }
                     });
                 };
             }
